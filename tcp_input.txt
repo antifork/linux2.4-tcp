@@ -2232,14 +2232,38 @@ vediamola nel dettaglio cercando di capire tutto!
 		 * ma se invece la abbasso (Reno classico) potrei trovarmi a perdere il self-clocking
 		 * in quanto potrei trovarmi nelle condizioni di non trasmettere nulla per lungo tempo.
 		 * Vediamo un esempio. 
-		 * Ipotizziamo cwnd = 20 ssthresh = 12 quando si entra in TCP_CA_Recovery. Reno classico
-		 * setta ssthresh = 10 e cwnd = 13. Verissimo che sono in congestion avoidance ma se avevo
-		 * cwnd = 20 prima di entrare in Recovery (quindi 20 pacchetti in flight) per poter 
-		 * trasmettere il successivo pacchetto devo aspettare un pò e precisamente che i pacchetti 
-		 * in flight diventino meno di 13 altrimenti resto ad aspettare!
-		 * L'effetto di questo simpatico giochino è trasmettere ogni due dupack e così ottengo 
-		 * lo stesso effetto di Reno classico e all'uscita da Fast Recovery troverò
+		 * Ipotizziamo cwnd = 20 ssthresh = 12 quando si entra in TCP_CA_Recovery. Questo significa
+		 * che prima di ricevere il primo dupack abbiamo 20 pacchetti in flight. Dopo 3 dupack sappiamo
+		 * (in assenza di SACK) che 3 pacchetti hanno lasciato la rete e sono nel receiving buffer
+		 * del peer. A questo punto Reno assume che un pacchetto sia stato perso e quindi al momento 16
+		 * pacchetti sono in fligth. Vengono settati ssthresh = 10 e cwnd = 13. Sono in congestion 
+		 * avoidance ma adesso per poter trasmettere il successivo pacchetto devo aspettare perchè
+		 * ho 16 pacchetti in flight e cwnd uguale a 13!
+		 * Dal draft sul rate-halving
+		 * 
+		 * "Fast retransmit relies on three duplicate acknowledgements to trigger the retransmission 
+		 * of a single lost segment. Once the Fast Retransmit has occurred, TCP then waits for enough 
+		 * additional duplicate ACKs to arrive, indicating that half of the data in flight has left the 
+		 * network.  Only when this has occurred will TCP send additional new data.
+		 *
+		 * La variante implementata in Linux come dicevamo è Rate-Halving. L'effetto di questo simpatico 
+		 * giochino è trasmettere ogni due dupack (per chi, leggendo il codice, non comprende come ciò possa
+		 * accadere posso anche fornire a richiesta qualche diagramma temporale sulla falsa riga di quelli 
+		 * del compianto W.R. Stevens) e così ottengo lo stesso effetto di Reno classico e all'uscita da Fast 
+		 * Recovery troverò
+		 *
 		 * cwnd = (cwnd_inizio_recovery - dupack_ricevuti)/2
+		 *
+		 * Vantaggi:
+		 * 1- il sender non resta fermo ma continua a trasmettere quindi evitando di perdere il 
+		 *    self-clocking.
+		 * 2- la chiusura della cwnd non è cieca come in Reno. Se sono arrivato a cwnd = 80 forse
+		 *    le condizioni della rete me lo consentivano no?! Che senso ha penalizzare scendendo
+		 *    a 40 + 3?! La riduzione/inflating della cwnd, detto in altri termini, è TROPPO conservativa!
+		 * 3- all'uscita possiamo arrivare a un valore di cwnd minore di cwnd/2 ed è giusto che sia così!
+		 *    Infatti devo dimezzare la finestra ma con riferimento ai dati delivered! Forse questa è una 
+		 *    delle poche cose saggie dette da Sally Floyd. 8) 
+		 *
 		 * Really cool...non c'è che dire!
 		 */  
 

@@ -1,0 +1,10 @@
+
+
+30/01/2003	Finalmente ho corretto alcuni errori che avevo introdotto nella descrizione 
+		del congestion control. Rispetto alla precedente revisione ( in cui il caos
+		soprattutto sintattico regnava sovrano) ora dovrebbe essere più chiaro come 
+		funziona la rate-halving, algoritmo delicato non solo da capire ma anche da		
+		spiegare! 8) 
+		
+
+Angelo Dell'Aera 'buffer' <buffer@antifork.org>

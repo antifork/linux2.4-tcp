@@ -1,0 +1,25 @@
+Questo file vuole essere un promemoria non solo per me ma anche per chi mi volesse 
+aiutare nell'opera di scrittura di questa documentazione. In generale il lavoro è
+privo di ordine quindi se qualcuno, aiutandomi, potesse evitare di aggiungere caos
+al caos sarebbe già un ottimo punto di partenza! 8)
+
+Parzialmente analizzate :
+
+- 3-way handshake e relative inizializzazioni
+- timers	(keepalive non trattato affatto)	
+
+Totalmente trascurate :
+
+- TCP output (questa ha priorità assoluta)
+- chiusura di una connessione
+
+Mi piacerebbe anche descrivere qualcosa sui socket e il modo in cui essi operano
+ma qui da solo, con tutta questa mole di lavoro, non credo ci potrò arrivare da
+solo! Per la serie "accorrete numerosi"!
+
+Un'idea.
+Per aumentare la leggibilità pensavo di mettere tutto in HTML realizzando in questa
+maniera una più semplice navigabilità tra tutte le funzioni (che sono tante) mediante
+dei link. Se salta fuori almeno un volenteroso che mi aiuta lo facciamo!
+
+Angelo Dell'Aera 'buffer' <buffer@antifork.org>

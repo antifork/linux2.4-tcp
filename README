@@ -1,25 +1,25 @@
-					12 Dicembre 2002
+						      12 Dicembre 2002
 
-Questo lavoro nasce a causa di un'esigenza personale di capire le logiche
-perverse del codice del kernel 2.4 di Linux per quanto riguarda il TCP.
-Ho barato..ora la verità...qualcuno ha pensato bene di pagarmi per 
-modificare il suddetto TCP e quindi, considerando che sono passato da
-giugno dalla condizione di studente alla non invidiabile condizione di
-disoccupato, ho accettato! :)
+Questo  lavoro nasce  a causa  di un'esigenza  personale di  capire le
+logiche  perverse  del codice  del  kernel  2.4  di Linux  per  quanto
+riguarda il TCP. Ho barato..ora la verità...  qualcuno ha pensato bene
+di pagarmi per  modificare il suddetto TCP e  quindi, considerando che
+sono  passato  da  giugno   dalla  condizione  di  studente  alla  non
+invidiabile condizione di disoccupato, ho accettato! :)
 
 Quello che mi preme sottolineare è che questo lavoro 
 1- è incompleto (almeno per il momento)
 2- potrebbe contenere imprecisioni
 
-Sto rilasciando questo lavoro perchè sono convinto che 1847 paia di 
-occhi vedano meglio di uno solo e 1600 cervelli pensino meglio di uno
-(1600 < 1847 è voluto...mica basta avere un paio di occhi per avere
-un cervello pensante! :) ).
+Sto rilasciando  questo lavoro perchè  sono convinto che 1847  paia di
+occhi vedano meglio di uno solo  e 1600 cervelli pensino meglio di uno
+(1600 < 1847 è voluto...mica basta avere un paio di occhi per avere un
+cervello pensante! :) ).
 
 Iniziate a leggere da tcp_input.txt...il resto verrà!
 
-Se trovate imprecisioni, errori o volete aiutarmi ad andare avanti
-non dovete fare altro che spedirmi una bella mail a 
+Se trovate imprecisioni, errori o volete aiutarmi ad andare avanti non
+dovete fare altro che spedirmi una bella mail a
 
 <buffer@users.sourceforge.net>
 
