@@ -1,0 +1,737 @@
+Cominciamo adesso ad affrontare la parte relativa all'output del TCP.
+
+/* This routine writes packets to the network.  It advances the
+ * send_head.  This happens as incoming acks open up the remote
+ * window for us.
+ *
+ * Returns 1, if no segments are in flight and we have queued segments, but
+ * cannot send anything now because of SWS or another problem.
+ */
+
+
+/* Prima di cominciare un chiarimento. SWS sta per Silly Window Syndrome e una sua descrizione
+ * molto lucida la trovate su W.R. Stevens "TCP/IP Illustrated vol. 1". Per chi non avesse la
+ * fortuna di possedere tale testo diciamo due parole. SWS è dovuta normalmente a entrambi gli
+ * end della comunicazione. Ipotizzate di notificare una finestra molto piccola ad esempio pochi
+ * bytes (invece di aspettare di poter notificare una finestra più grande)  al peer il quale, 
+ * senza attendere, vi manda un pacchetto con quei bytes (non aspettando una notifica di finestra
+ * più grande). Risultato? Ci si scambia allegramente piccoli pacchetti alla faccia dell'efficienza!
+ * Come si evita questo?
+ * 1- Il receiver non deve notificare finestre piccole e in particolare se la finestra è minore
+ *    di MSS esso DEVE notificare 0 fino a quando non può aprire la finestra 
+ * 	a) fino all'MSS che ha ricevuto 
+ *		oppure
+ *	b) fino a metà del receiver buffer space se fosse più piccolo dell'MSS
+ *
+ * 2- Il sender NON deve trasmettere fino a quando non è vera una di queste condizioni :
+ *	a) un segmento full-sized può essere trasmesso
+ *	b) si può spedire almeno metà della maximum sized window notificata dal peer
+ *	--> Questa condizione serve per "parlare la stessa lingua" con quei beoti di TCP (anche se 
+ *          penso siano rari ormai...qualcuno ha notizie da Redmond?! 8) )che notificano sempre finestre
+ *          , anche se più piccole di MSS.
+ *	c) se è disabilitato Nagle (vedi sotto) e non siamo in attesa di ACK possiamo spedire quello che 
+ 	    vogliamo.
+ *	--> Questa condizione blocca il sender dallo spedire segmenti piccoli se ci sono piccoli outstanding 
+ *	    packets in flight (lunghezza < MSS) e Nagle è abilitato.
+ */ 
+
+
+int tcp_write_xmit(struct sock *sk, int nonagle)
+{
+        struct tcp_opt *tp = &(sk->tp_pinfo.af_tcp);
+        unsigned int mss_now;
+
+        /* If we are closed, the bytes will have to remain here.
+         * In time closedown will finish, we empty the write queue and all
+         * will be happy.
+         */
+        if(sk->state != TCP_CLOSE) {
+                struct sk_buff *skb;
+                int sent_pkts = 0;
+
+                /* Account for SACKS, we may need to fragment due to this.
+                 * It is just like the real MSS changing on us midstream.
+                 * We also handle things correctly when the user adds some
+                 * IP options mid-stream.  Silly to do, but cover it.
+                 */
+                mss_now = tcp_current_mss(sk);
+
+
+		/* Questa condizione nel while richiede un chiarimento importante. Partiamo da tcp_send_test()
+ 		 * il cui codice è il seguente
+		 * 
+		 * static __inline__ int tcp_snd_test(struct tcp_opt *tp, struct sk_buff *skb,
+                                   unsigned cur_mss, int nonagle)
+		 * {
+ 		 *  return ((nonagle==1 || tp->urg_mode || !tcp_nagle_check(tp, skb, cur_mss, nonagle)) &&
+                 *	((tcp_packets_in_flight(tp) < tp->snd_cwnd) || (TCP_SKB_CB(skb)->flags & TCPCB_FLAG_FIN)) &&
+                 *	!after(TCP_SKB_CB(skb)->end_seq, tp->snd_una + tp->snd_wnd));
+		 * }
+		 *
+		 * Commenti ufficiali:
+		 *
+		 *      RFC 1122 - section 4.2.3.4
+         	 *
+         	 *      We must queue if
+         	 *
+         	 *      a) The right edge of this frame exceeds the window
+         	 *      b) There are packets in flight and we have a small segment
+         	 *         [SWS avoidance and Nagle algorithm]
+         	 *         (part of SWS is done on packetization)
+         	 *         Minshall version sounds: there are no _small_
+         	 *         segments in flight. (tcp_nagle_check)
+         	 *      c) We have too many packets 'in flight'
+         	 *
+         	 *      Don't use the nagle rule for urgent data (or
+         	 *      for the final FIN -DaveM).
+         	 *
+         	 *      Also, Nagle rule does not apply to frames, which
+         	 *      sit in the middle of queue (they have no chances
+         	 *      to get new data) and if room at tail of skb is
+         	 *      not enough to save something seriously (<32 for now).
+         	 *
+		 *
+		 * Non è il massimo della chiarezza ma vediamo di interpretarla un pezzo alla volta. Partiamo
+		 * dall'algoritmo di Nagle (per una trattazione esauriente vedere RFC896). Questo algoritmo è
+		 * stato pensato per ottimizzare il traffico interattivo di dati su TCP. Infatti, considerando una
+		 * sessione interattiva, si vede che spesso il payload dei dati è composto da un numero molto
+		 * esiguo di bytes (spesso anche uno soltanto). Questo non è un problema su LAN perchè normalmente
+		 * è difficile vedere in un contesto locale congestione. Ma può diventare un problema in WAN.
+		 * Per questo motivo, Nagle ha proposto questo allegro algoritmo. In pratica, l'algoritmo dice
+		 * che se una connessione TCP ha dati outstanding che non sono ancora stati ackati allora non è
+		 * possibile spedire segmenti piccoli fino a quando questi stessi dati non sono stati ackati.
+		 * Questo cosa comporta? Che in una sessione interattiva dopo aver spedito il primo byte ad 
+		 * esempio, mentre attendo l'ack di questo non posso spedire altri dati. Nel frattempo, il TCP
+		 * al sender accumula tutti i bytes da spedire e quando l'ack arriva lui li spedirà in un unico
+		 * segmento riducendo di fatto il numero di outstanding packets. Il bello di questo algoritmo
+		 * è che è intrinsecamente self-clocking perchè più velocemente arrivano gli ack più veloce
+		 * si trasmette. A questo punto è opportuno notare che tramite la setsockopt(2) da user space
+		 * passando come optname TCP_NODELAY e il flag 1, la tcp_setsockopt() setterà nella struct
+		 * tcp_opt legata al socket il field tp->nonagle a 1 disabilitando l'algoritmo di Nagle. 
+		 * Vediamo quindi di capire il senso dell'ultimo argomento passato alla funzione. Per fare 
+		 * questo vediamo che 
+		 *
+		 * static __inline__ int tcp_skb_is_last(struct sock *sk, struct sk_buff *skb)
+		 * {
+        	 *  return (skb->next == (struct sk_buff*)&sk->write_queue);
+		 * }
+		 *
+		 * Quindi, se skb è l'ultimo nella write queue la condizione è verificata. In tal caso l'argomento
+		 * passato sarà nonagle altrimenti 1. Questo fa tornare alla mente le parole del saggio Dave
+		 * Miller... 
+                 *
+		 *	     "Also, Nagle rule does not apply to frames, which
+                 *           sit in the middle of queue (they have no chances
+                 *           to get new data) and if room at tail of skb is
+                 *           not enough to save something seriously (<32 for now).
+		 *
+		 * Chiaro il senso? Se sono nel bel mezzo della write queue non ha senso Nagle! Questo perchè
+		 * "this has no chance to get new data!". 
+		 *
+		 * Stessa cosa se non ho spazio nel tail della sk_buff per metterci almeno 32 bytes.
+		 * Analogamente se è settato URG spedisci subito e non aspettare!
+		 * Vediamo tcp_nagle_check() adesso. Prima di procedere un'occhiata lanciamo `man 7 tcp' e 
+ 		 * leggiamo attentamente.	
+		 *
+		 * SOCKET OPTIONS
+       		 * To  set  or get a TCP socket option, call getsockopt(2) to read or setsockopt(2) to write the 
+		 * option with the socket family argument set to SOL_TCP.  In addition, most SOL_IP socket options 
+		 * are valid on TCP sockets. For more information see ip(7).
+		 *
+       		 * TCP_NODELAY
+              	 * Turn  the Nagle algorithm off. This means that packets are always sent as soon as possible and 
+		 * no unnecessary delays are introduced, at the cost of more packets in the network. Expects an integer 
+		 * boolean flag.
+		 *
+       		 * TCP_MAXSEG
+              	 * Set or receive the maximum segment size for outgoing TCP packets. If this option is set before  
+		 * connection establishment, it also changes the MSS value announced to the other end in the initial 
+		 * packet. Values greater than the interface MTU are ignored and have no effect.
+		 *
+       		 * TCP_CORK
+              	 * If enabled don't send out partial frames.  All queued partial frames are sent  when  the  option  is  
+		 * cleared again.   This  is  useful  for prepending headers before calling sendfile(2), or for throughput 
+		 * optimization. This option cannot be combined with TCP_NODELAY.
+		 *
+		 * Tutto chiaro? Bene ora un consiglio per chi voglia cogliere tutto bene. Vedete in tcp.c la funzione
+                 * tcp_setsockopt(). Riporto un frammento del codice.
+		 *
+		 * switch(optname) {
+        	 * case TCP_MAXSEG:
+                 *	/* values greater than interface MTU won't take effect.  however at
+                 *	 * the point when this call is done we typically don't yet know
+                 *	 * which interface is going to be used
+                 * 	 */
+                 * 	if(val < 8 || val > MAX_TCP_WINDOW) {
+                 *       	err = -EINVAL;
+                 *       	break;
+                 *	}
+                 *	tp->user_mss = val;
+                 *	break;
+		 * 
+		 * case TCP_NODELAY:
+                 *	/* You cannot try to use this and TCP_CORK in
+                 * 	 * tandem, so let the user know.
+                 * 	 */
+                 *	if (tp->nonagle == 2) {
+                 *	       err = -EINVAL;
+                 *	       break;
+                 *	}
+                 *	tp->nonagle = (val == 0) ? 0 : 1;
+                 *	if (val)
+                 *	       tcp_push_pending_frames(sk, tp);
+                 *	break;
+		 *
+		 * case TCP_CORK:
+                 *	/* When set indicates to always queue non-full frames.
+                 *	 * Later the user clears this option and we transmit
+                 *	 * any pending partial frames in the queue.  This is
+                 *	 * meant to be used alongside sendfile() to get properly
+                 *	 * filled frames when the user (for example) must write
+                 * 	 * out headers with a write() call first and then use
+                 * 	 * sendfile to send out the data parts.
+                 *
+                 * 	 * You cannot try to use TCP_NODELAY and this mechanism
+                 * 	 * at the same time, so let the user know.
+                 *	 */
+		 *
+                 * 	if (tp->nonagle == 1) {
+                 *	       err = -EINVAL;
+                 *	       break;
+                 *	}
+                 *	if (val != 0) {
+                 *	       tp->nonagle = 2;
+                 *	} else {
+                 *	       tp->nonagle = 0;
+		 *	       tcp_push_pending_frames(sk, tp);
+                 *	}
+                 *	break;
+		 *
+		 *  [...]
+		 *
+		 *  <NOTA POLEMICA> 
+		 *  Dopo la TCP_CORK ci sono altre opzioni settabili tramite setsockopt(2)...
+		 *  peccato che NON SIANO DOCUMENTATE nella man page!!!!
+		 *  </NOTA POLEMICA>
+	         *
+		 * Si nota quindi che tp->nonagle vale
+		 * 1 se è settato TCP_NODELAY
+		 * 2 se è settato TCP_CORK
+		 *
+		 * Return 0, if packet can be sent now without violation Nagle's rules:
+   		 * 1. It is full sized.
+   		 * 2. Or it contains FIN.
+   		 * 3. Or TCP_NODELAY was set.
+   		 * 4. Or TCP_CORK is not set, and all sent packets are ACKed.
+      		 * With Minshall's modification: all sent small packets are ACKed.
+ 		 *
+		 * static __inline__ int
+		 * tcp_nagle_check(struct tcp_opt *tp, struct sk_buff *skb, unsigned mss_now, int nonagle)
+		 * {
+        	 * return (skb->len < mss_now &&
+                 *   !(TCP_SKB_CB(skb)->flags & TCPCB_FLAG_FIN) &&
+                 *   (nonagle == 2 || (!nonagle && tp->packets_out && tcp_minshall_check(tp))));
+		 * }
+		 */
+
+                while((skb = tp->send_head) &&
+                      tcp_snd_test(tp, skb, mss_now, tcp_skb_is_last(sk, skb) ? nonagle : 1)) {
+
+			/* 
+			 * Se siamo qui allora c'è qualcosa da trasmettere e possiamo trasmetterla!
+			 */
+
+			/* 
+			 * Nel caso in cui la lunghezza dell'skb dovesse eccedere l'attuale MSS in questo
+		         * caso l'skb va frammentato su due o più sk_buff. Dai commenti si deduce che questa
+		 	 * dovrebbe essere l'eccezione e non la norma! Inoltre si noti che fin ad ora abbiamo
+			 * solo dati e niente header TCP.
+			 */
+
+ 			if (skb->len > mss_now) {
+                                if (tcp_fragment(sk, skb, mss_now))
+                                        break;
+                        }
+
+                        TCP_SKB_CB(skb)->when = tcp_time_stamp;
+
+			/* Si trasmette! Vedi sotto.
+			 * Notare una cosa. Alla tcp_transmit_skb() viene passata una copia di skb tramite
+			 * la skb_clone(). Perchè? Semplice direi! Fino a quando questi dati non vengono
+			 * ackati dal peer non posso buttarli.
+			 */
+
+                        if (tcp_transmit_skb(sk, skb_clone(skb, GFP_ATOMIC)))
+                                break;
+
+                        /* Advance the send_head.  This one is sent out. */
+
+			/* Vedi questa funzione commentata più sotto. */
+
+                        update_send_head(sk, tp, skb);
+
+			/* Se abbiamo appena spedito un pacchetto di lunghezza minore di mss_now
+		         * memorizziamo il last byte sequence number in tp->snd_sml.
+		         */
+
+                        tcp_minshall_update(tp, mss_now, skb);
+                        sent_pkts = 1;
+                }
+
+                if (sent_pkts) {
+                        tcp_cwnd_validate(sk, tp);
+                        return 0;
+                }
+
+                return !tp->packets_out && tp->send_head;
+        }
+        return 0;
+}
+
+/* 
+ * Cerchiamo di capire il senso di questa variante dell'algoritmo di Nagle.
+ * Per i più volenterosi, consiglio la lettura di draft-minshall-nagle-01.txt.
+ * In quel draft si leggono le seguenti illuminanti righe
+ *  
+ * The current Nagle algorithm does not require any other state to be
+ * kept by TCP on a system.
+ *
+ * The proposed modification to the Nagle algorithm does,
+ * unfortunately, require one new state variable to be kept by TCP:
+ * ``snd.sml'' is a TCP variable which names the last byte of data in
+ * the most recently transmitted small packet.
+ *
+ * The current Nagle algorithm can be described as follows:
+ *
+ *       "If a TCP has less than a full-sized packet to transmit,
+ *       and if any previous packet has not yet been acknowledged,
+ *       do not transmit a packet."
+ *
+ *  and in pseudo-code:
+ *
+ *       if ((packet.size < Eff.snd.MSS) && (snd.nxt > snd.una)) {
+ *               do not send the packet;
+ *       }
+ *
+ *  The proposed Nagle algorithm modifies this as follows:
+ *
+ *       "If a TCP has less than a full-sized packet to transmit,
+ *       and if any previously transmitted less than full-sized
+ *        packet has not yet been acknowledged, do not transmit
+ *       a packet."
+ *
+ *  and in pseudo-code:
+ *
+ *       if (packet.size < Eff.snd.MSS) {
+ *               if (snd.sml > snd.una)) {
+ *                       do not send the packet;
+ *               } else {
+ *                       snd.sml = snd.nxt+packet.size;
+ *                       send the packet;
+ *               }
+ *       }
+ *
+ *  In other words, when running Nagle, only look at the recent
+ *  transmission (and acknowledgement) of small packets (rather than
+ *  all packets, as in the current Nagle).
+ */
+
+
+static __inline__ int tcp_minshall_check(struct tcp_opt *tp)
+{
+        return after(tp->snd_sml,tp->snd_una) &&
+                !after(tp->snd_sml, tp->snd_nxt);
+}
+
+static __inline__ void tcp_minshall_update(struct tcp_opt *tp, int mss, struct sk_buff *skb)
+{
+        if (skb->len < mss)
+                tp->snd_sml = TCP_SKB_CB(skb)->end_seq;
+}
+
+
+/* This routine actually transmits TCP packets queued in by
+ * tcp_do_sendmsg().  This is used by both the initial
+ * transmission and possible later retransmissions.
+ * All SKB's seen here are completely headerless.  It is our
+ * job to build the TCP header, and pass the packet down to
+ * IP so it can do the same plus pass the packet off to the
+ * device.
+ *
+ * We are working here with either a clone of the original
+ * SKB, or a fresh unique copy made by the retransmit engine.
+ */
+
+int tcp_transmit_skb(struct sock *sk, struct sk_buff *skb)
+{
+        if(skb != NULL) {
+                struct tcp_opt *tp = &(sk->tp_pinfo.af_tcp);
+                struct tcp_skb_cb *tcb = TCP_SKB_CB(skb);
+                int tcp_header_size = tp->tcp_header_len;
+                struct tcphdr *th;
+                int sysctl_flags;
+                int err;
+
+#define SYSCTL_FLAG_TSTAMPS     0x1
+#define SYSCTL_FLAG_WSCALE      0x2
+#define SYSCTL_FLAG_SACK        0x4
+
+                sysctl_flags = 0;
+
+		/* E' settato SYN? Bene allora decidiamo in base alle sysctl settate cosa mettere nell'header
+		 * e quindi quanti bytes dobbiamo riservare all'header stesso. Notare che in questo caso viene
+		 * SEMPRE inclusa una notifica al peer del proprio MSS. Questa notifica può essere realizzata
+		 * soltanto nei segmenti con flag SYN settato.
+		 * Se il flag SYN non è settato si controlla se ci sono SACK block da trasmettere e nel caso 
+		 * si alloca spazio per contenerli. Si noti che l'allocazione vera e propria di spazio avviene
+		 * alla fine con la skb_push() e th punterà all'inizio dell'header TCP (ancora da costruire).
+		 */ 
+
+
+                if (tcb->flags & TCPCB_FLAG_SYN) {
+                        tcp_header_size = sizeof(struct tcphdr) + TCPOLEN_MSS;
+                        if(sysctl_tcp_timestamps) {
+                                tcp_header_size += TCPOLEN_TSTAMP_ALIGNED;
+                                sysctl_flags |= SYSCTL_FLAG_TSTAMPS;
+                        }
+                        if(sysctl_tcp_window_scaling) {
+                                tcp_header_size += TCPOLEN_WSCALE_ALIGNED;
+                                sysctl_flags |= SYSCTL_FLAG_WSCALE;
+ 			}
+                        if(sysctl_tcp_sack) {
+                                sysctl_flags |= SYSCTL_FLAG_SACK;
+                                if(!(sysctl_flags & SYSCTL_FLAG_TSTAMPS))
+                                        tcp_header_size += TCPOLEN_SACKPERM_ALIGNED;
+                        }
+                } else if (tp->eff_sacks) {
+                        /* A SACK is 2 pad bytes, a 2 byte header, plus
+                         * 2 32-bit sequence numbers for each SACK block.
+                         */
+                        tcp_header_size += (TCPOLEN_SACK_BASE_ALIGNED +
+                                            (tp->eff_sacks * TCPOLEN_SACK_PERBLOCK));
+                }
+                th = (struct tcphdr *) skb_push(skb, tcp_header_size);
+
+		/* Mettiamo in skb un riferimento all'inizio dell'header TCP e successivamente costruiamo
+		 * l'header. I commenti non servono qui.
+		 */
+
+                skb->h.th = th;
+                skb_set_owner_w(skb, sk);
+
+		/* Build TCP header and checksum it. */
+                th->source              = sk->sport;
+                th->dest                = sk->dport;
+                th->seq                 = htonl(tcb->seq);
+                th->ack_seq             = htonl(tp->rcv_nxt);
+                *(((__u16 *)th) + 6)    = htons(((tcp_header_size >> 2) << 12) | tcb->flags);
+
+
+		/* 
+		 * Vediamo la tcp_select_window() più sotto.
+	  	 */
+
+                if (tcb->flags & TCPCB_FLAG_SYN) {
+                        /* RFC1323: The window in SYN & SYN/ACK segments
+                         * is never scaled.
+                         */
+                        th->window      = htons(tp->rcv_wnd);
+                } else {
+                        th->window      = htons(tcp_select_window(sk));
+                }
+                th->check               = 0;
+                th->urg_ptr             = 0;
+
+                if (tp->urg_mode &&
+                    between(tp->snd_up, tcb->seq+1, tcb->seq+0xFFFF)) {
+                        th->urg_ptr             = htons(tp->snd_up-tcb->seq);
+                        th->urg                 = 1;
+                }
+
+		/* Qui dobbiamo differenziare perchè se stiamo inviando un SYN dobbiamo controllare sysctl_flags
+		 * settato in precedenza per vedere quali opzioni appendere all'header, oltre a MSS che come abbiamo
+		 * detto viene sempre messo in un SYN. Se non si tratta di SYN allora le opzioni da settare le vediamo
+		 * direttamente nella tcp_opt. In questo caso ci serve passare when nell'eventualità in cui serva 
+		 * costruire il timestamp.
+		 */
+
+                if (tcb->flags & TCPCB_FLAG_SYN) {
+                        tcp_syn_build_options((__u32 *)(th + 1),
+                                              tcp_advertise_mss(sk),
+                                              (sysctl_flags & SYSCTL_FLAG_TSTAMPS),
+                                              (sysctl_flags & SYSCTL_FLAG_SACK),
+                                              (sysctl_flags & SYSCTL_FLAG_WSCALE),
+                                              tp->rcv_wscale,
+                                              tcb->when,
+                                              tp->ts_recent);
+                } else {
+                        tcp_build_and_update_options((__u32 *)(th + 1),
+                                                     tp, tcb->when);
+
+                        TCP_ECN_send(sk, tp, skb, tcp_header_size);
+                }
+
+		/* A questo punto calcoliamo il checksum */
+
+                tp->af_specific->send_check(sk, th, skb->len, skb);
+
+                if (tcb->flags & TCPCB_FLAG_ACK)
+                        tcp_event_ack_sent(sk);
+
+                if (skb->len != tcp_header_size)
+                        tcp_event_data_sent(tp, skb);
+
+                TCP_INC_STATS(TcpOutSegs);
+
+		/* Fatto tutto? OK adesso il segmento viene spedito a IP tramite la queue_xmit che nel caso
+		 * di IPv4 (ma anche di IPv6) è la ip_queue_xmit(). Da questo momento se la "consegna" ha successo
+		 * TCP ha finito il suo lavoro.
+		 */
+
+                err = tp->af_specific->queue_xmit(skb);
+                if (err <= 0)
+                        return err;
+
+                tcp_enter_cwr(tp);
+
+                /* NET_XMIT_CN is special. It does not guarantee,
+                 * that this packet is lost. It tells that device
+                 * is about to start to drop packets or already
+                 * drops some packets of the same priority and
+                 * invokes us to send less aggressively.
+                 */
+                return err == NET_XMIT_CN ? 0 : err;
+        }
+        return -ENOBUFS;
+#undef SYSCTL_FLAG_TSTAMPS
+#undef SYSCTL_FLAG_WSCALE
+#undef SYSCTL_FLAG_SACK
+}
+
+Questa non ha davvero bisogno di commenti. Portiamo avanti la send head al segmento successivo e se
+abbiamo esaurito la coda mettiamo a NULL send_head. In seguito portiamo avanti snd_nxt e se prima di
+trasmettere non c'erano pacchetti nel pipe resettiamo il Retransmit Timer al valore presente in tp->rto. 
+
+static __inline__
+void update_send_head(struct sock *sk, struct tcp_opt *tp, struct sk_buff *skb)
+{
+        tp->send_head = skb->next;
+        if (tp->send_head == (struct sk_buff *) &sk->write_queue)
+                tp->send_head = NULL;
+        tp->snd_nxt = TCP_SKB_CB(skb)->end_seq;
+        if (tp->packets_out++ == 0)
+                tcp_reset_xmit_timer(sk, TCP_TIME_RETRANS, tp->rto);
+}
+
+
+/*
+ * Qui non riporto commenti. Infatti, leggendo sotto i commenti da me riportati,
+ * dovrebbe essere tutto molto chiaro (almeno questo è quello che spero). 
+ */
+
+static __inline__ u16 tcp_select_window(struct sock *sk)
+{
+        struct tcp_opt *tp = &(sk->tp_pinfo.af_tcp);
+        u32 cur_win = tcp_receive_window(tp);
+        u32 new_win = __tcp_select_window(sk);
+
+        /* Never shrink the offered window */
+        if(new_win < cur_win) {
+                /* Danger Will Robinson!
+                 * Don't update rcv_wup/rcv_wnd here or else
+                 * we will not be able to advertise a zero
+                 * window in time.  --DaveM
+                 *
+                 * Relax Will Robinson.
+                 */
+                new_win = cur_win;
+        }
+        tp->rcv_wnd = new_win;
+        tp->rcv_wup = tp->rcv_nxt;
+
+        /* RFC1323 scaling applied */
+        new_win >>= tp->rcv_wscale;
+  	
+	/* If we advertise zero window, disable fast path. */
+        if (new_win == 0)
+                tp->pred_flags = 0;
+
+        return new_win;
+}
+
+
+
+/* Compute the actual receive window we are currently advertising.
+ * Rcv_nxt can be after the window if our peer push more data
+ * than the offered window.
+ */
+
+/* Per questa funzione vedi commenti in tcp_input.txt */
+
+static __inline__ u32 tcp_receive_window(struct tcp_opt *tp)
+{
+        s32 win = tp->rcv_wup + tp->rcv_wnd - tp->rcv_nxt;
+
+        if (win < 0)
+                win = 0;
+        return (u32) win;
+}
+
+/*
+ * Prima di leggere qui vedi sotto.
+ */
+
+
+/* This function returns the amount that we can raise the
+ * usable window based on the following constraints
+ *
+ * 1. The window can never be shrunk once it is offered (RFC 793)
+ * 2. We limit memory per socket
+ *
+ * RFC 1122:
+ * "the suggested [SWS] avoidance algorithm for the receiver is to keep
+ *  RECV.NEXT + RCV.WIN fixed until:
+ *  RCV.BUFF - RCV.USER - RCV.WINDOW >= min(1/2 RCV.BUFF, MSS)"
+ *
+ * i.e. don't raise the right edge of the window until you can raise
+ * it at least MSS bytes.
+ *
+ * Unfortunately, the recommended algorithm breaks header prediction,
+ * since header prediction assumes th->window stays fixed.
+ *
+ * Strictly speaking, keeping th->window fixed violates the receiver
+ * side SWS prevention criteria. The problem is that under this rule
+ * a stream of single byte packets will cause the right side of the
+ * window to always advance by a single byte.
+ *
+ * ------Commento al commento :
+ *
+ * Cosa stanno farneticando questi diavolacci di kernel hackers? Con calma 
+ * con calma.... RFC1122 suggerisce nell'ambito di SWS avoidance di tenere 
+ * fisso l'estremo destro della finestra di ricezione ossia RECV.NEXT + RCV.WIN 
+ * fino a quando 
+ * RCV.BUFF - RCV.USER - RCV.WINDOW >= min(1/2 RCV.BUFF, MSS)
+ * (vedi commmenti all'inizio)
+ *
+ * MA (....e c'è un MA!) se RECV.NXT + RCV.WIN è mantenuto costante e l'altro 
+ * peer non implementa SWS avoidance e mi trasmette 3 bytes ad esempio RECV.NXT 
+ * va avanti di 3 e RCV.WIN diminuisce di 3 ossia 'bye bye header prediction!'... 
+ * niente fast path! Vi sembra bella questa cosa? IMHO no!
+ *
+ * -----------------------------   
+ *
+ * Of course, if the sender implements sender side SWS prevention
+ * then this will not be a problem.
+ *
+ * BSD seems to make the following compromise:
+ *
+ *      If the free space is less than the 1/4 of the maximum
+ *      space available and the free space is less than 1/2 mss,
+ *      then set the window to 0.
+ *      [ Actually, bsd uses MSS and 1/4 of maximal _window_ ]
+ *      Otherwise, just prevent the window from shrinking
+ *      and from being larger than the largest representable value.
+ *
+ * This prevents incremental opening of the window in the regime
+ * where TCP is limited by the speed of the reader side taking
+ * data out of the TCP receive queue. It does nothing about
+ * those cases where the window is constrained on the sender side
+ * because the pipeline is full.
+ *
+ * BSD also seems to "accidentally" limit itself to windows that are a
+ * multiple of MSS, at least until the free space gets quite small.
+ * This would appear to be a side effect of the mbuf implementation.
+ * Combining these two algorithms results in the observed behavior
+ * of having a fixed window size at almost all times.
+ *
+ * Below we obtain similar behavior by forcing the offered window to
+ * a multiple of the mss when it is feasible to do so.
+ *
+ * Note, we don't "adjust" for TIMESTAMP or SACK option bytes.
+ * Regular options like TIMESTAMP are taken into account.
+ */
+
+u32 __tcp_select_window(struct sock *sk)
+{
+        struct tcp_opt *tp = &sk->tp_pinfo.af_tcp;
+        /* MSS for the peer's data.  Previous verions used mss_clamp
+         * here.  I don't know if the value based on our guesses
+         * of peer's MSS is better for the performance.  It's more correct
+         * but may be worse for the performance because of rcv_mss
+         * fluctuations.  --SAW  1998/11/1
+         */
+        int mss = tp->ack.rcv_mss;
+        int free_space = tcp_space(sk);
+        int full_space = min_t(int, tp->window_clamp, tcp_full_space(sk));
+        int window;
+
+        if (mss > full_space)
+                mss = full_space;
+
+        if (free_space < full_space/2) {
+                tp->ack.quick = 0;
+
+                if (tcp_memory_pressure)
+                        tp->rcv_ssthresh = min(tp->rcv_ssthresh, 4U*tp->advmss);
+
+                if (free_space < mss)
+                        return 0;
+ 	}
+
+        if (free_space > tp->rcv_ssthresh)
+                free_space = tp->rcv_ssthresh;
+
+        /* Get the largest window that is a nice multiple of mss.
+         * Window clamp already applied above.
+         * If our current window offering is within 1 mss of the
+         * free space we just keep it. This prevents the divide
+         * and multiply from happening most of the time.
+         * We also don't do any window rounding when the free space
+         * is too small.
+         */
+        window = tp->rcv_wnd;
+        if (window <= free_space - mss || window > free_space)
+                window = (free_space/mss)*mss;
+
+        return window;
+}
+
+
+Cominciamo a comprendere l'arcano che si manifesta in tutto il suo splendore
+nelle prossime due funzioni analizzate.
+
+Prima di tutto capiamo il senso della sysctl_tcp_adv_win_scale. Infatti, è
+necessario sapere che il socket receive buffer è condiviso tra il kernel e
+l'applicazione. Una parte di questo buffer implementa quindi la finestra
+che il TCP notifica nell'header. Il resto è riservato all'applicazione (serve
+ad isolare la parte relativa al networking dalle latenze tipiche dell'applicazione
+e dello scheduling). Dalla documentazione si legge che questa sysctl "Count 
+buffering overhead as bytes/2^tcp_adv_win_scale (if tcp_adv_win_scale > 0) 
+or bytes-bytes/2^(-tcp_adv_win_scale), if it is <= 0. The default is 2."
+Quindi se il default è 2 abbiamo bytes/4 il che significa che l'application
+buffer è 1/4 del totale. Dovrebbe essere più chiaro ora il senso. 
+
+
+static inline int tcp_win_from_space(int space)
+{
+	return sysctl_tcp_adv_win_scale<=0 ?
+		(space>>(-sysctl_tcp_adv_win_scale)) :
+		space - (space>>sysctl_tcp_adv_win_scale);
+}
+
+/*
+ * sk->rmem_alloc indica il numero di bytes "occupati" nel socket receive
+ * buffer.. ergo quella differenza è lo spazio libero.. e il cerchio si
+ * chiude!
+ */
+	
+/* Note: caller must be prepared to deal with negative returns */ 
+static inline int tcp_space(struct sock *sk)
+{
+	return tcp_win_from_space(sk->rcvbuf - atomic_read(&sk->rmem_alloc));
+} 
+
+static inline int tcp_full_space( struct sock *sk)
+{
+	return tcp_win_from_space(sk->rcvbuf); 
+}

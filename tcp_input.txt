@@ -538,7 +538,13 @@ delle cose serie.
 	} while(0)
 
 Non spiego nulla perchè è troppo banale! Un'altra coda tutto qui! Ora alla luce di tutto ciò 
-rivediamo quanto visto e capiamo l'arte.  
+rivediamo quanto visto e capiamo l'arte. Una considerazione sulla backlog queue è d'obbligo
+prima di andare avanti. Infatti questa queue viene usata soltanto quando il socket è locked
+in un determinato stato. Che significa questo?! Bisogna tenere presente che ci sono delle
+situazioni nelle quali si ha la necessità di lockare lo stato del socket per evitare che
+dei pacchetti in ingresso lo modifichino rendendo inconsistente qualunque valutazione.
+Allora quello che si fa è lockare il socket con una lock_sock() o sue varianti e appoggiare
+i pacchetti nella backlog queue fino a quando il socket è lockato nel BH processing.   
 
  bh_lock_sock(sk);
                 ret = 0;

@@ -8,6 +8,270 @@ connessione. Per questo scopo viene utilizzata la funzione tcp_connect()
 che riporto e commento qui sotto. Prima di vedere questa però analizziamo
 la tcp_connect_init() che è molto importante per lo scopo che stiamo
 analizzando. Ma poichè oggi mi piace cambiare opinione ogni 30 millisecondi
+partiamo dalla tcp_v4_connect() perchè da qui ha origine tutto!
+
+
+/* This will initiate an outgoing connection. */
+
+	int tcp_v4_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
+	{
+		struct tcp_opt *tp = &(sk->tp_pinfo.af_tcp);
+		struct sockaddr_in *usin = (struct sockaddr_in *) uaddr;
+		struct rtable *rt;
+		u32 daddr, nexthop;
+		int tmp;
+		int err;
+	
+		if (addr_len < sizeof(struct sockaddr_in))
+			return(-EINVAL);
+	
+		if (usin->sin_family != AF_INET)
+			return(-EAFNOSUPPORT);
+	
+		nexthop = daddr = usin->sin_addr.s_addr;
+		if (sk->protinfo.af_inet.opt && sk->protinfo.af_inet.opt->srr) {
+			if (daddr == 0)
+				return -EINVAL;
+			nexthop = sk->protinfo.af_inet.opt->faddr;
+		}
+	
+		tmp = ip_route_connect(&rt, nexthop, sk->saddr,
+				       RT_CONN_FLAGS(sk), sk->bound_dev_if);
+		if (tmp < 0)
+			return tmp;
+	
+		if (rt->rt_flags&(RTCF_MULTICAST|RTCF_BROADCAST)) {
+			ip_rt_put(rt);
+			return -ENETUNREACH;
+		}
+	
+		__sk_dst_set(sk, &rt->u.dst);
+		sk->route_caps = rt->u.dst.dev->features;
+	
+		if (!sk->protinfo.af_inet.opt || !sk->protinfo.af_inet.opt->srr)
+			daddr = rt->rt_dst;
+	
+		if (!sk->saddr)
+			sk->saddr = rt->rt_src;
+		sk->rcv_saddr = sk->saddr;
+	
+		if (tp->ts_recent_stamp && sk->daddr != daddr) {
+			/* Reset inherited state */
+			tp->ts_recent = 0;
+			tp->ts_recent_stamp = 0;
+			tp->write_seq = 0;
+		}
+	
+		if (sysctl_tcp_tw_recycle &&
+		    !tp->ts_recent_stamp &&
+		    rt->rt_dst == daddr) {
+			struct inet_peer *peer = rt_get_peer(rt);
+	
+			/* VJ's idea. We save last timestamp seen from
+			 * the destination in peer table, when entering state TIME-WAIT
+			 * and initialize ts_recent from it, when trying new connection.
+			 */
+	
+			if (peer && peer->tcp_ts_stamp + TCP_PAWS_MSL >= xtime.tv_sec) {
+				tp->ts_recent_stamp = peer->tcp_ts_stamp;
+				tp->ts_recent = peer->tcp_ts;
+			}
+		}
+	
+		sk->dport = usin->sin_port;
+		sk->daddr = daddr;
+	
+		tp->ext_header_len = 0;
+		if (sk->protinfo.af_inet.opt)
+			tp->ext_header_len = sk->protinfo.af_inet.opt->optlen;
+	
+		tp->mss_clamp = 536;
+	
+		/* Socket identity is still unknown (sport may be zero).
+		 * However we set state to SYN-SENT and not releasing socket
+		 * lock select source port, enter ourselves into the hash tables and
+		 * complete initalization after this.
+		 */
+		tcp_set_state(sk, TCP_SYN_SENT);
+		err = tcp_v4_hash_connect(sk);
+		if (err)
+			goto failure;
+	
+		if (!tp->write_seq)
+			tp->write_seq = secure_tcp_sequence_number(sk->saddr, sk->daddr,
+								   sk->sport, usin->sin_port);
+	
+		sk->protinfo.af_inet.id = tp->write_seq^jiffies;
+	
+		err = tcp_connect(sk);
+		if (err)
+			goto failure;
+	
+		return 0;
+	
+	failure:
+		tcp_set_state(sk, TCP_CLOSE);
+		__sk_dst_reset(sk);
+		sk->route_caps = 0;
+		sk->dport = 0;
+		return err;
+	}
+	
+
+
+/* 
+ * Do all connect socket setups that can be done AF independent.
+ */ 
+static inline void tcp_connect_init(struct sock *sk)
+{
+	struct dst_entry *dst = __sk_dst_get(sk);
+	struct tcp_opt *tp = &(sk->tp_pinfo.af_tcp);
+
+	/* We'll fix this up when we get a response from the other end.
+	 * See tcp_input.c:tcp_rcv_state_process case TCP_SYN_SENT.
+	 */
+
+	/* Qui viene fissata la dimensione dell'header TCP. In realtà qui questa viene fissata considerando 
+	 * la dimensione dell'header TCP canonico (definito in /usr/src/linux/include/linux/tcp.h) e quindi
+	 * 20 bytes a cui viene aggiunta, se sono abilitati i timestamp attraverso la sysctl opportuna, un
+	 * numero di bytes sufficiente a piazzare la timestamp option.
+	 */
+
+	tp->tcp_header_len = sizeof(struct tcphdr) +
+		(sysctl_tcp_timestamps ? TCPOLEN_TSTAMP_ALIGNED : 0);
+
+	/* If user gave his TCP_MAXSEG, record it to clamp */
+
+	/* Spiegazione. L'utente ha la possibilità tramite ioctl di settare un limite per MSS. In tal caso
+	 * mss_clamp viene settato a tale valore. 
+	 * Inoltre poichè stiamo aprendo la connessione adesso la massima finestra (max_window) vista non 
+	 * può essere settata che a 0. Anche perchè non l'abbiamo vista! 8)
+	 * Prima di andare avanti attacco un commento di Alan che chiarisce il ruolo di alcune variabili.
+	 * Leggilo perchè questo commento è relativo a tcp_sync_mss() che trovi subito dopo.
+         *
+	 * This function synchronize snd mss to current pmtu/exthdr set.	 
+	 *
+	 * tp->user_mss is mss set by user by TCP_MAXSEG. It does NOT counts
+	 * for TCP options, but includes only bare TCP header.
+	 *
+	 * tp->mss_clamp is mss negotiated at connection setup.
+	 * It is minumum of user_mss and mss received with SYN.
+	 * It also does not include TCP options.
+	 *
+	 * tp->pmtu_cookie is last pmtu, seen by this function.
+	 *
+	 * tp->mss_cache is current effective sending mss, including
+	 * all tcp options except for SACKs. It is evaluated,
+	 * taking into account current pmtu, but never exceeds
+	 * tp->mss_clamp.
+	 *
+	 * NOTE1. rfc1122 clearly states that advertised MSS
+	 * DOES NOT include either tcp or ip options.
+	 *
+	 * NOTE2. tp->pmtu_cookie and tp->mss_cache are READ ONLY outside
+	 * this function.			--ANK (980731)
+	 */
+
+	if (tp->user_mss)
+		tp->mss_clamp = tp->user_mss;
+	tp->max_window = 0;
+	tcp_sync_mss(sk, dst->pmtu);
+
+	/* Settiamo un limite sulla massima finestra da notificare al peer (se non è stato già fatto) e 
+	 * settiamo l'advertised MSS.
+	 */
+
+	if (!tp->window_clamp)
+		tp->window_clamp = dst->window;
+	tp->advmss = dst->advmss;
+
+	/* Questa è bella davvero! In pratica si inizializza la variabile RCV_MSS che sarebbe nient'altro
+	 * che MSS usato dal peer. Ora il più ganzo della brigata già lo vedo alzare la mano e chiedere
+	 * "Mi scusi ma se sto spedendo il SYN come faccio a sapere che diavolo succede dall'altra parte?"
+	 * 30 e lode figliuolo! 8) Infatti qui per quanto strano possa sembrare si gioca a indovinare!
+	 * Con un accorgimento. Nell'indecisione tra sovrastimare e sottostimare si sottostima.
+	 * La correzione di questo valore la si fa poi in corsa con la tcp_measure_rcv_mss().
+	 */
+
+	tcp_initialize_rcv_mss(sk);
+
+	/* Determiniamo ora la finestra da offrire al peer. Inoltre viene determinato eventualmente il
+	 * window scaling da offrire. Il resto della funzione è semplice da capire e la lascio come
+	 * compito per il volenteroso di turno.
+	 */
+
+	tcp_select_initial_window(tcp_full_space(sk),
+				  tp->advmss - (tp->ts_recent_stamp ? tp->tcp_header_len - sizeof(struct tcphdr) : 0),
+				  &tp->rcv_wnd,
+				  &tp->window_clamp,
+				  sysctl_tcp_window_scaling,
+				  &tp->rcv_wscale);
+
+	tp->rcv_ssthresh = tp->rcv_wnd;
+
+	sk->err = 0;
+	sk->done = 0;
+	tp->snd_wnd = 0;
+	tcp_init_wl(tp, tp->write_seq, 0);
+	tp->snd_una = tp->write_seq;
+	tp->snd_sml = tp->write_seq;
+	tp->rcv_nxt = 0;
+	tp->rcv_wup = 0;
+	tp->copied_seq = 0;
+
+	tp->rto = TCP_TIMEOUT_INIT;
+	tp->retransmits = 0;
+	tcp_clear_retrans(tp);
+}
+
+
+/*
+ * Build a SYN and send it off.
+ */ 
+int tcp_connect(struct sock *sk)
+{
+	struct tcp_opt *tp = &(sk->tp_pinfo.af_tcp);
+	struct sk_buff *buff;
+
+	tcp_connect_init(sk);
+
+	buff = alloc_skb(MAX_TCP_HEADER + 15, sk->allocation);
+	if (unlikely(buff == NULL))
+		return -ENOBUFS;
+
+	/* Reserve space for headers. */
+	skb_reserve(buff, MAX_TCP_HEADER);
+
+	TCP_SKB_CB(buff)->flags = TCPCB_FLAG_SYN;
+	TCP_ECN_send_syn(tp, buff);
+	TCP_SKB_CB(buff)->sacked = 0;
+	buff->csum = 0;
+	TCP_SKB_CB(buff)->seq = tp->write_seq++;
+	TCP_SKB_CB(buff)->end_seq = tp->write_seq;
+	tp->snd_nxt = tp->write_seq;
+	tp->pushed_seq = tp->write_seq;
+
+	/* Send it off. */
+	TCP_SKB_CB(buff)->when = tcp_time_stamp;
+	tp->retrans_stamp = TCP_SKB_CB(buff)->when;
+	__skb_queue_tail(&sk->write_queue, buff);
+	tcp_charge_skb(sk, buff);
+	tp->packets_out++;
+	tcp_transmit_skb(sk, skb_clone(buff, GFP_KERNEL));
+	TCP_INC_STATS(TcpActiveOpens);
+
+	/* Timer for repeating the SYN until an answer. */
+	tcp_reset_xmit_timer(sk, TCP_TIME_RETRANS, tp->rto);
+	return 0;
+}
+
+
+=======
+Cominciamo ad analizzare il caso in cui sia il nostro host a stabilire la 
+connessione. Per questo scopo viene utilizzata la funzione tcp_connect()
+che riporto e commento qui sotto. Prima di vedere questa però analizziamo
+la tcp_connect_init() che è molto importante per lo scopo che stiamo
+analizzando. Ma poichè oggi mi piace cambiare opinione ogni 30 millisecondi
 partiamo dalla tcp_v4_connect() perchè da qui ha origine tutto. 
 
 Nota importante.
@@ -17,6 +281,7 @@ sys_connect() in net/socket.c. Ora nella sys_connect() a un certo punto dopo
 alcune operazioni come ad esempio la sockfd_lookup che serve a ripescare il
 sock su cui compiere le operazioni (vedere l'interfaccia del VFS per questo...
 se comincio a parlare anche di questo è finita...)
+>>>>>>> 1.3
 
 
 /* This will initiate an outgoing connection. */

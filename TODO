@@ -7,10 +7,10 @@ Parzialmente analizzate :
 
 - 3-way handshake e relative inizializzazioni
 - timers	(keepalive non trattato affatto)	
+- TCP output (questa ha priorità assoluta)
 
 Totalmente trascurate :
 
-- TCP output (questa ha priorità assoluta)
 - chiusura di una connessione
 
 Mi piacerebbe anche descrivere qualcosa sui socket e il modo in cui essi operano
