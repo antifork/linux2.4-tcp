@@ -2219,7 +2219,7 @@ vediamola nel dettaglio cercando di capire tutto!
 		 * una misura della capacità del pipe. Infatti, slow start e congestion avoidance 
 		 * possono essere lette in questi termini. Se ho un valore di ssthresh in un determinato
 		 * istante allora questa è una stima di quanti segmenti posso avere nel pipe. Se cwnd
-		 * < cwnd sono in slow start e quindi aumento velocemente cwnd (ogni ACK che ricevo
+		 * < ssthresh sono in slow start e quindi aumento velocemente cwnd (ogni ACK che ricevo
 		 * lo aumento di 1) per arrivare velocemente a ssthresh. Quando cwnd > ssthresh sono
 		 * in congestion avoidance e aumento cwnd di 1 ogni RTT. Perchè? Perchè le condizioni
 		 * della rete potrebbero mutare a mio favore e quindi devo continuare a probare la
