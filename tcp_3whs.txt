@@ -206,11 +206,7 @@ meno che il socket non sia in stato ESTABLISHED o TIME_WAIT).
 					} else {
 						int tmo;
 	
-						/* Quanto mi sono girate le palle a sapere che il
-						 * supporto per SO_LINGER con l_onoff diverso da 0 e
-						 * l_linger 0 l'ha implementato quel minchione di 
-						 * Salvatore Sanfilippo! Vabbè andiamo avanti. Di 
-						 * default la close(2) cerca di spedire i dati nel 
+						/* Di default la close(2) cerca di spedire i dati nel 
 						 * send buffer, chiude la connessione e amen! 
 						 * Ma se usiamo setsockopt(2) (SOL_SOCKET|SO_LINGER)
 					 	 * possiamo cambiare questo comportamento evitando
