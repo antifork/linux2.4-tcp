@@ -9,9 +9,19 @@ TCP Timers
 
 Vedere il sorgente tcp_timer.c.
 
-Questa è l'inizializzazione dei 3 timer per il retransmit, per i delayed
-ACKs e per il keepalive probe (che da quanto stabilito da RFC dovrebbe
-avvenire dopo 2 ore di connessione idle).
+Questa è l'inizializzazione dei 3 timer per il retransmit, per i delayed ACKs e per il keepalive 
+probe (che da quanto stabilito da RFC dovrebbe avvenire dopo 2 ore di connessione idle). Ora 
+notiamo che nell'inizializzazione l'handler 
+
+- per il retransmit timer è tcp_write_timer() 
+- per il delayed ACK timer è tcp_delack_timer()
+- per il keepalive timer è tcp_keepalive_timer()
+
+Questi 3 handler accettano come parametro la struct sock su cui dovranno operare e questo è 
+normale a pensarci bene. Infatti, l'expiring di un timer è asincrono nel senso che potrebbe
+verificarsi in un qualunque momento. Quindi serve dire all'handler su quale socket mettere
+le mani. Tutto chiaro? Andiamo avanti.
+
 
 void tcp_init_xmit_timers(struct sock *sk)
 {
@@ -32,26 +42,34 @@ void tcp_init_xmit_timers(struct sock *sk)
         sk->timer.data = (unsigned long) sk;
 }
 
-Andiamo avanti....ricordando che
+
+Andiamo avanti dopo aver visto la timer_pending(). 
+
 
 static inline int timer_pending (const struct timer_list * timer)
         {
                 return timer->list.next != NULL;
         }
 
-analizziamo la seguente funzione....
+
+Non starò qui ad analizzare come funzionino i timer dinamici (per una trattazione esauriente potete 
+vedere Cesati - Bovet "Understanding The Linux Kernel" ). Analizziamo la seguente funzione.
+
 
 void tcp_clear_xmit_timers(struct sock *sk)
 {
         struct tcp_opt *tp = &sk->tp_pinfo.af_tcp;
 
+	/*
+         * tp->pending memorizza il numero di ritrasmissioni schedulate. Iniziamo a porre
+         * questo valore a 0.
+	 */
+
         tp->pending = 0;
 
-                /* Non ci sono ritrasmissioni da effettuare e
-                 * abbiamo rimosso con successo il timer.....
-                 * bene allora possiamo concederci un bel
-                 * atomic_dec sul refcnt di sk...stessa storia
-                 * per gli altri timer.
+                /* Non ci sono ritrasmissioni da effettuare e abbiamo rimosso con successo il 
+		 * timer..... bene allora possiamo concederci un bel atomic_dec sul refcnt di 
+		 * sk...stessa storia per gli altri timer.
                  */
 
         if (timer_pending(&tp->retransmit_timer) &&
@@ -68,9 +86,159 @@ void tcp_clear_xmit_timers(struct sock *sk)
                 __sock_put(sk);
 }
 
-Vediamo gli handler lanciati alla scadenza dei timer. Per i nostri scopi
-è importante RTO handler tcp_write_timer() con parametro sk.
-Vediamo il codice....
+
+Vediamo gli handler lanciati alla scadenza dei timer. 
+
+
+static void tcp_write_timer(unsigned long data)
+{
+        struct sock *sk = (struct sock*)data;
+        struct tcp_opt *tp = &sk->tp_pinfo.af_tcp;
+        int event;
+	
+	/*
+         * Operazione critica. Acquisiamo uno spinlock con la bh_lock_sock() definita
+         * come segue
+         *
+         * BH context may only use the following locking interface. */
+         * #define bh_lock_sock(__sk)   spin_lock(&((__sk)->lock.slock))
+         * #define bh_unlock_sock(__sk) spin_unlock(&((__sk)->lock.slock))
+         * 
+	 * Attenzione al ruolo di sk->lock.users perchè questo è fondamentalmente un
+	 * semaforo il cui valore decide se il socket è lockato. Se il socket è lockato
+	 * tramite questo semaforo ricorda che i segmenti in arrivo vanno in backlog
+	 * queue (in pratica è lo stato del socket ad essere lockato). In questo caso
+	 * il timer viene rischedulato tra circa 50 ms.
+	 */
+
+        bh_lock_sock(sk);
+        if (sk->lock.users) {
+                /* Try again later */
+ 		if (!mod_timer(&tp->retransmit_timer, jiffies + (HZ/20)))
+                        sock_hold(sk);
+                goto out_unlock;
+        }
+
+	/* 
+	 * Se il socket è in stato closed oppure se non schedulati timer di ritrasmissione
+	 * e/o di probing salta ad out. In out la sock_put() diminuisce automaticamente il
+	 * refcnt del socket e se questo è 0 distrugge il sock. Per capire il senso niente
+	 * di meglio di un commento ufficiale...
+	 *
+	 * * Socket reference counting postulates.
+	 *
+	 * * Each user of socket SHOULD hold a reference count.
+	 * * Each access point to socket (an hash table bucket, reference from a list,
+	 *   running timer, skb in flight MUST hold a reference count.
+	 * * When reference count hits 0, it means it will never increase back.
+	 * * When reference count hits 0, it means that no references from
+	 *   outside exist to this socket and current process on current CPU
+	 *   is last user and may/should destroy this socket.
+	 * * sk_free is called from any context: process, BH, IRQ. When
+	 *   it is called, socket has no references from outside -> sk_free
+	 *   may release descendant resources allocated by the socket, but
+	 *   to the time when it is called, socket is NOT referenced by any
+	 *   hash tables, lists etc.
+	 * * Packets, delivered from outside (from network or from another process)
+	 *   and enqueued on receive/error queues SHOULD NOT grab reference count,
+	 *   when they sit in queue. Otherwise, packets will leak to hole, when
+	 *   socket is looked up by one cpu and unhasing is made by another CPU.
+	 *   It is true for udp/raw, netlink (leak to receive and error queues), tcp
+	 *   (leak to backlog). Packet socket does all the processing inside
+	 *   BR_NETPROTO_LOCK, so that it has not this race condition. UNIX sockets
+	 *   use separate SMP lock, so that they are prone too.
+	 */
+
+
+        if (sk->state == TCP_CLOSE || !tp->pending)
+                goto out;
+
+
+	/*
+ 	 * Se il timeout è spirato rischeduliamo il timer guardando il valore appropriato in
+	 * tp->timeout e saltiamo ad out (vedi sopra).
+	 */
+
+        if ((long)(tp->timeout - jiffies) > 0) {
+                if (!mod_timer(&tp->retransmit_timer, tp->timeout))
+                        sock_hold(sk);
+                goto out;
+        }
+
+        event = tp->pending;
+        tp->pending = 0;
+
+	/*
+	 * A che si deve l'onore? Ad una ritrasmissione o a un probing?!
+	 */
+
+        switch (event) {
+        case TCP_TIME_RETRANS:
+                tcp_retransmit_timer(sk);
+                break;
+        case TCP_TIME_PROBE0:
+                tcp_probe_timer(sk);
+                break;
+        }
+        TCP_CHECK_TIMER(sk);
+
+out:
+        tcp_mem_reclaim(sk);
+out_unlock:
+        bh_unlock_sock(sk);
+        sock_put(sk);
+}
+
+
+
+static void tcp_probe_timer(struct sock *sk)
+{
+        struct tcp_opt *tp = &sk->tp_pinfo.af_tcp;
+        int max_probes;
+
+        if (tp->packets_out || !tp->send_head) {
+                tp->probes_out = 0;
+                return;
+        }
+
+        /* *WARNING* RFC 1122 forbids this
+         *
+         * It doesn't AFAIK, because we kill the retransmit timer -AK
+         *
+         * FIXME: We ought not to do it, Solaris 2.5 actually has fixing
+         * this behaviour in Solaris down as a bug fix. [AC]
+         *
+         * Let me to explain. probes_out is zeroed by incoming ACKs
+         * even if they advertise zero window. Hence, connection is killed only
+         * if we received no ACKs for normal connection timeout. It is not killed
+         * only because window stays zero for some time, window may be zero
+         * until armageddon and even later. We are in full accordance
+         * with RFCs, only probe timer combines both retransmission timeout
+         * and probe timeout in one bottle.                             --ANK
+         */
+        max_probes = sysctl_tcp_retries2;
+
+        if (sk->dead) {
+                int alive = ((tp->rto<<tp->backoff) < TCP_RTO_MAX);
+
+                max_probes = tcp_orphan_retries(sk, alive);
+
+                if (tcp_out_of_resources(sk, alive || tp->probes_out <= max_probes))
+                        return;
+        }
+
+        if (tp->probes_out > max_probes) {
+                tcp_write_err(sk);
+        } else {
+                /* Only send another probe if we didn't close things up. */
+                tcp_send_probe0(sk);
+        }
+}
+
+
+
+Analizziamo l'RTO handler tcp_write_timer() con parametro sk. Vediamo il codice. Come detto in precedenza,
+in data passiamo un puntatore alla struct sock da gestire.
 
 
 static void tcp_write_timer(unsigned long data)
@@ -79,8 +247,14 @@ static void tcp_write_timer(unsigned long data)
                 struct tcp_opt *tp = &sk->tp_pinfo.af_tcp;
                 int event;
 
-
-                /* Operazione critica...lock! */
+                /* 
+		 * Operazione critica. Acquisiamo uno spinlock con la bh_lock_sock() definita
+		 * come segue
+		 *
+		 * BH context may only use the following locking interface. */
+		 * #define bh_lock_sock(__sk)	spin_lock(&((__sk)->lock.slock))
+		 * #define bh_unlock_sock(__sk)	spin_unlock(&((__sk)->lock.slock)) 
+		 */
 
                 bh_lock_sock(sk);
                 if (sk->lock.users) {
@@ -90,15 +264,16 @@ static void tcp_write_timer(unsigned long data)
                         goto out_unlock;
                 }
 
-                /* Il socket è in stato CLOSED? E che ci stiamo a fare
-                 * qui? Ovviamente si salta a out anche se pending = 0
-                 * pending 'scheduled timer event'
+		/*
+                 * Il socket è in stato CLOSED? E che ci stiamo a fare qui? Ovviamente si salta a 
+		 * out in questo caso. Stesso discorso se non sono schedulate ritrasmissioni.
                  */
 
                 if (sk->state == TCP_CLOSE || !tp->pending)
                         goto out;
 
-                /* Timeout > jiffies ?
+		/*
+                 * Timeout > jiffies? Questo significa che il timer è andato in timeout.
 		 * Aggiornare il timer è d'obbligo allora!
                  */
 
@@ -115,6 +290,7 @@ static void tcp_write_timer(unsigned long data)
                 case TCP_TIME_RETRANS:
 
                         /* Eccolo qui RTO handling inizia qui */
+
                         tcp_retransmit_timer(sk);
                         break;
                 case TCP_TIME_PROBE0:
@@ -138,9 +314,8 @@ static void tcp_write_timer(unsigned long data)
         {
                 struct tcp_opt *tp = &sk->tp_pinfo.af_tcp;
 
-                /* Se snd_nxt - snd_una == 0 usciamo....
-                 * l'unica cosa in flight è questo handler
-                 * che non DEVE fare nulla!
+                /* Se non abbiamo packets in flight usciamo....l'unica cosa in flight è questo handler
+                 * che non DEVE fare nulla! 8)
                  */
 
                 if (tp->packets_out == 0)
@@ -148,14 +323,11 @@ static void tcp_write_timer(unsigned long data)
 
                 BUG_TRAP(!skb_queue_empty(&sk->write_queue));
 
-                /* Niente finestra (snd_wnd).
-                 * Oltre a questo che significa sk->dead?! Qui Dave
-                 * Miller una parolina ce la poteva anche buttare nei
-                 * sorgenti....vabbè andiamo avanti!
-                 * Inoltre lo stato deve essere diverso da
-                 * TCP_SYN_SENT | TCP_SYN_RECV (penso a causa del fatto che
-                 * in questo caso ci sia un timer a parte di 75 secondi
-                 * per la ricezione del SYN|ACK o per il SYN...vedremo!)
+                /* Niente finestra (snd_wnd). Oltre a questo che significa sk->dead?! Qui Dave
+                 * Miller una parolina ce la poteva anche buttare nei sorgenti....vabbè andiamo avanti!
+                 * Inoltre lo stato deve essere diverso da TCP_SYN_SENT | TCP_SYN_RECV (penso a causa 
+		 * del fatto che in questo caso ci sia un timer a parte di 75 secondi per la ricezione 
+		 * del SYN|ACK o per il SYN...vedremo!)
                  */
 
                 if (tp->snd_wnd == 0 && !sk->dead &&
@@ -187,9 +359,8 @@ static void tcp_write_timer(unsigned long data)
                                 goto out;
                         }
 
-			/* Ecco qui il punto di ingresso..si cambia stato
-                         * nella TCP state machine. Si entra in stato Loss!
-                         * Subito dopo si ritrasmette.
+			/* Ecco qui il punto di ingresso..si cambia stato nella TCP state machine. Si entra 
+			 * in stato Loss (vedi tcp_input.txt). Subito dopo si ritrasmette.
                          */
 
                         tcp_enter_loss(sk, 0);

@@ -228,13 +228,62 @@ int tcp_v4_rcv(struct sk_buff *skb)
 		 *
 		 * Cerchiamo di essere più chiari? Ok.
 		 * La bh_lock_sock richiamata sul socket sk non fa altro che 
-		 * acquisire lo spinlock. Questo significa che questa porzione di
-		 * codice NON può essere eseguita contemporaneamente su due o
-		 * più CPU. Quindi se ricevo un altro pacchetto e il software 
-		 * interrupt viene gestito da un'altra CPU, arrivato qui trovo
-		 * lo spinlock chiuso e comincio a fare 'spinning around' fino al
-		 * rilascio dello spinlock stesso. Ecco cosa intendevo prima
-		 * anche se mi sa che neanche stavolta sono stato troppo chiaro! 8)
+		 * acquisire lo spinlock. Ora per capire il giochino che si sta
+		 * sviluppando è importante fare alcune precisazioni. Prima di tutto
+		 * il ruolo della backlog queue. La backlog queue viene usata soltanto 
+		 * quando il socket è locked in un determinato stato. Che significa 
+		 * questo?! Bisogna tenere presente che ci sono delle situazioni nelle 
+		 * quali si ha la necessità di lockare lo stato del socket per evitare 
+		 * che dei pacchetti in ingresso lo modifichino rendendo inconsistente 
+		 * qualunque valutazione. Allora quello che si fa è lockare il socket 
+		 * con una lock_sock() o sue varianti e appoggiare i pacchetti nella 
+		 * backlog queue fino a quando il socket è lockato nel BH processing.
+		 * Vediamo la lock_sock() per capire bene questo concetto
+ 		 * 
+		 * #define lock_sock(__sk) \
+		 * do {    spin_lock_bh(&((__sk)->lock.slock)); \
+        	 * 	if ((__sk)->lock.users != 0) \
+                 *		__lock_sock(__sk); \
+                 * 	(__sk)->lock.users = 1; \
+        	 * spin_unlock_bh(&((__sk)->lock.slock)); \
+		 * } while(0)
+		 *
+		 * Notare che il codice della lock_sock() è protetto dallo stesso
+		 * spinlock ed è giusto che sia così in base a quanto detto in 
+		 * precedenza. 
+		 * 
+		 * void __lock_sock(struct sock *sk)
+		 * {
+        	 *  DECLARE_WAITQUEUE(wait, current);
+		 *
+        	 *  add_wait_queue_exclusive(&sk->lock.wq, &wait);
+        	 *  for(;;) {
+                 *  	current->state = TASK_UNINTERRUPTIBLE;
+                 *	spin_unlock_bh(&sk->lock.slock);
+                 * 	schedule();
+                 *	spin_lock_bh(&sk->lock.slock);
+                 *	if(!sk->lock.users)
+                 *	       break;
+        	 * 	}
+		 *  current->state = TASK_RUNNING;
+        	 *  remove_wait_queue(&sk->lock.wq, &wait);
+		 * }
+		 *
+		 * Classica implementazione di un meccanismo di locking. Se il semaforo
+		 * users è chiuso (ossia se il suo valore è diverso da 0) si chiama la
+		 * __sock_lock() che definisce una wait queue entry e la infila nella
+		 * wait queue sk->lock.wq (nota che nella wait queue questo task è settato
+		 * come esclusivo e questo migliora le performance quando si tratterà di
+		 * risvegliarlo). Si rilascia lo spinlock e si chiama lo scheduler. Quando
+		 * il processo viene rischedulato si riacquisce lo spinlock e si controlla
+		 * se il semaforo è libero. In questo caso si esce dal loop infinito altrimenti
+		 * il tutto si ripete.
+		 *
+		 * Quando alla fine si esce dal loop la lock_sock() pone users a 1 di fatto
+		 * chiudendo il semaforo.
+		 *
+		 * Quindi il semaforo sincronizza gli utenti.
+		 *
 		 */ 
 	
 		bh_lock_sock(sk);
@@ -385,7 +434,9 @@ Vediamo la tcp_prequeue() che cercherò di spiegare...ma spiegare l'arte è cosa a
 		 * la funzione tcp_prequeue_init() si nota che task viene settato a 
 		 * NULL. Il suo valore può essere cambiato durante la connessione.
 		 * Vedremo dopo quando succede questo ma per ora basti capire che
-		 * se è diverso da NULL allora possiamo andare in prequeuing.
+		 * se è diverso da NULL allora possiamo andare in prequeuing. In 
+		 * particolare il suo valore è diverso da NULL se esiste un reader
+		 * del socket attualmente schedulato.
 		 */
 	
 		if (tp->ucopy.task) {
@@ -538,13 +589,7 @@ delle cose serie.
 	} while(0)
 
 Non spiego nulla perchè è troppo banale! Un'altra coda tutto qui! Ora alla luce di tutto ciò 
-rivediamo quanto visto e capiamo l'arte. Una considerazione sulla backlog queue è d'obbligo
-prima di andare avanti. Infatti questa queue viene usata soltanto quando il socket è locked
-in un determinato stato. Che significa questo?! Bisogna tenere presente che ci sono delle
-situazioni nelle quali si ha la necessità di lockare lo stato del socket per evitare che
-dei pacchetti in ingresso lo modifichino rendendo inconsistente qualunque valutazione.
-Allora quello che si fa è lockare il socket con una lock_sock() o sue varianti e appoggiare
-i pacchetti nella backlog queue fino a quando il socket è lockato nel BH processing.   
+rivediamo quanto visto e capiamo l'arte. 
 
  bh_lock_sock(sk);
                 ret = 0;
@@ -836,7 +881,10 @@ Vediamo adesso la tcp_rcv_established().
 				}
 			} else {
 
-				/* Ci sono dati gente... */
+				/* Ci sono dati gente... attenzione!
+				 * La variabile eaten è definita soltanto se ci sono dati
+				 * da ackare. 
+				 */
 
 				int eaten = 0;
 
@@ -849,8 +897,7 @@ Vediamo adesso la tcp_rcv_established().
 				 * testa dei dati non ancora letti.
 				 * Mi è ignoto a questo punto il senso della successiva
 				 * __set_current_state(TASK_RUNNING)...non dovrebbe già
-				 * essere in quello stato? Trattasi forse di ulteriore
-				 * ottimizzazione per tenere il task nella run queue?
+				 * essere in quello stato? 
 				 */
 	
 				if (tp->ucopy.task == current &&
@@ -879,7 +926,7 @@ Vediamo adesso la tcp_rcv_established().
 	
 					if (!tcp_copy_to_iovec(sk, skb, tcp_header_len)) {
 
-						/* E'andata bene. I dati sono disponibili in tp->ucopy.iov. 
+						/* E'andata bene. I dati sono disponibili a user space! 
 						 * La __skb_pull rimuove dati dall'inizio di skb e precisamente 
 						 * rimuove l'header TCP. Possiamo avanzare rcv_nxt e per ricordare
 						 * che tutte queste splendide cose sono accadute poniamo eaten a 1.
@@ -909,7 +956,23 @@ Vediamo adesso la tcp_rcv_established().
 					/* Bulk data transfer: receiver */
 
 					/* Beh è andata comunque! Rimuoviamo l'header TCP mediante __skb_pull 
-					 * e mettiamo il bambino in coda nella receive queue. 
+					 * e mettiamo il bambino in coda nella receive queue. Per completezza
+					 * vediamo che fa la tcp_set_owner_r().
+				         *
+					 * static inline void tcp_set_owner_r(struct sk_buff *skb, struct sock *sk)
+					 * {
+        				 *  skb->sk = sk;
+        				 *  skb->destructor = tcp_rfree;
+        				 *  atomic_add(skb->truesize, &sk->rmem_alloc);
+        				 *  sk->forward_alloc -= skb->truesize;
+					 * }
+					 *
+					 * Semplice direi. Per prima cosa setta sk come owner di skb. Setta il 
+					 * destructor dell'skb e successivamente poichè rmem_alloc rappresenta 
+					 * il numero di bytes "impegnati" nella receive queue incrementa questo 
+					 * valore di truesize e diminuisce dello stesso valore forward_alloc. Il
+					 * destructor (che non commento) fa il duale delle ultime due istruzioni.
+ 					 *
 					 */
 
 					__skb_pull(skb,tcp_header_len);
@@ -938,11 +1001,10 @@ Vediamo adesso la tcp_rcv_established().
 						goto no_ack;
 				}
 	
-				/* Se eaten = 1 (vedi sopra) controlliamo se ci
-				 * troviamo in quickack mode e se è così spediamo
-				 * immediatamente un ack altrimenti lo spediamo
-				 * ritardato. Nel caso in cui eaten sia 0 si esegue
-			 	 * un controllo per vedere se è necessario spedire l'ack.
+				/* Se eaten = 1 (vedi sopra) controlliamo se ci troviamo in quickack mode e se 
+				 * è così spediamo immediatamente un ack altrimenti lo spediamo ritardato. Nel 
+				 * caso in cui eaten sia 0 si esegue un controllo per vedere se è necessario 
+				 * spedire l'ack.
 				 */
 			
 				if (eaten) {
@@ -1341,6 +1403,34 @@ a proposito del calcolo/verifica del checksum fatto dalla NIC ).
 		return -EFAULT;
 	}
 
+
+Commentiamo questa adesso. Non scendo nei particolari perchè è semplice ma
+voglio far notare la presenza di quella copy_to_user() che copia i dati da
+kernel space a user space.... devo dire altro? :)
+
+int memcpy_toiovec(struct iovec *iov, unsigned char *kdata, int len)
+{
+        int err = -EFAULT;
+        
+        while(len>0)
+        {
+                if(iov->iov_len)
+                {
+                        int copy = min_t(unsigned int, iov->iov_len, len);
+                        if (copy_to_user(iov->iov_base, kdata, copy))
+                                goto out;
+                        kdata+=copy;
+                        len-=copy;
+                        iov->iov_len-=copy;
+                        iov->iov_base+=copy;
+                }
+                iov++;
+        }
+        err = 0;
+out:
+        return err;
+}
+
 	
 
 Vediamo la tcp_event_data_rcv() col commento di Dave Miller...grand'uomo che risponde
@@ -1439,11 +1529,71 @@ alle mie mail e in quanto tale merita rispetto!
 	}
 
 
-Vediamo la tcp_ack() adesso. Prima di partire una riga da tenere presente in tcp_input.c
-è la seguente
+
+Vediamo la __tcp_ack_snd_check().
+Casi in cui è possibile ackare i dati :
+1 --- (a) (rcv_nxt - rcv_wup) > ack.rcv_mss  (questo dovrebbe servire per Silly Window
+					      Sindrome avoidance) 
+      (b) se il limite destro della finestra va oltre rcv_wnd (?)
+
+oppure
+
+2 --- siamo in quickack mode
+
+oppure 
+
+3 --- se ofo_possible è uguale a 1 (indicando che c'è la possibilità che ci siano
+      segmenti out of order) e se la testa della coda degli out of order non è NULL
+      (ad indicare coda vuota). 
+
+/*
+ * Check if sending an ack is needed.
+ */
+static __inline__ void __tcp_ack_snd_check(struct sock *sk, int ofo_possible)
+{
+        struct tcp_opt *tp = &(sk->tp_pinfo.af_tcp);
+
+            /* More than one full frame received... */
+        if (((tp->rcv_nxt - tp->rcv_wup) > tp->ack.rcv_mss
+             /* ... and right edge of window advances far enough.
+              * (tcp_recvmsg() will send ACK otherwise). Or...
+              */
+             && __tcp_select_window(sk) >= tp->rcv_wnd) ||
+            /* We ACK each frame or... */   
+            tcp_in_quickack_mode(tp) ||
+            /* We have out of order data. */
+            (ofo_possible &&
+             skb_peek(&tp->out_of_order_queue) != NULL)) {
+                /* Then ack it now */
+                tcp_send_ack(sk);
+        } else {
+                /* Else, send delayed ack. */
+                tcp_send_delayed_ack(sk);
+        }
+}
 
 
-#define FLAG_SLOWPATH		0x100 /* Do not skip RFC checks for window update.*/
+
+
+
+Vediamo la tcp_ack() adesso. Prima di partire alcune righe da tenere presenti in 
+tcp_input.c
+
+#define FLAG_DATA               0x01 /* Incoming frame contained data.          */
+#define FLAG_WIN_UPDATE         0x02 /* Incoming ACK was a window update.       */
+#define FLAG_DATA_ACKED         0x04 /* This ACK acknowledged new data.         */
+#define FLAG_RETRANS_DATA_ACKED 0x08 /* "" "" some of which was retransmitted.  */
+#define FLAG_SYN_ACKED          0x10 /* This ACK acknowledged SYN.              */
+#define FLAG_DATA_SACKED        0x20 /* New SACK.                               */
+#define FLAG_ECE                0x40 /* ECE in this ACK                         */
+#define FLAG_DATA_LOST          0x80 /* SACK detected data lossage.             */
+#define FLAG_SLOWPATH           0x100 /* Do not skip RFC checks for window update.*/
+
+#define FLAG_ACKED              (FLAG_DATA_ACKED|FLAG_SYN_ACKED)
+#define FLAG_NOT_DUP            (FLAG_DATA|FLAG_WIN_UPDATE|FLAG_ACKED)
+#define FLAG_CA_ALERT           (FLAG_DATA_SACKED|FLAG_ECE)
+#define FLAG_FORWARD_PROGRESS   (FLAG_ACKED|FLAG_DATA_SACKED)
+
 
 Bene possiamo andare...
 
