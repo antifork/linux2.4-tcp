@@ -1,0 +1,309 @@
+Descrizione della procedura di ricezione di un pacchetto a livello di TCP
+-------------------------------------------------------------------------
+autore : Angelo Dell'Aera - buffer@users.sourceforge.net
+--------------------------------------------------------
+
+
+
+Analizziamo alcune funzioni tratte dal sorgente tcp_input.c e la cui comprensione
+è fondamentale per capire alcuni aspetti discussi nel file tcp.txt. Iniziamo dalla
+tcp_measure_rcv_mss() che come dice il commento serve ad adattare il valore del
+Maximum Segment Size (MSS) usato per i delayed acks al 'mondo reale'.
+
+
+/* Adapt the MSS value used to make delayed ack decision to the
+ * real world.
+ */
+static __inline__ void tcp_measure_rcv_mss(struct tcp_opt *tp, struct sk_buff *skb)
+{
+        unsigned int len, lss;
+
+	/* ack.last_seg_size è la dimensione dell'ultimo segmento
+	 * ricevuto e il suo valore viene assegnato a lss.
+	 */
+
+        lss = tp->ack.last_seg_size;
+        tp->ack.last_seg_size = 0;
+
+        /* skb->len may jitter because of SACKs, even if peer
+         * sends good full-sized frames.
+         */
+
+        len = skb->len;
+
+	/* ack.rcv_mss è il valore di MSS usato per i delayed acks */
+
+        if (len >= tp->ack.rcv_mss) {
+                tp->ack.rcv_mss = len;
+        } else {
+                /* Otherwise, we make more careful check taking into account,
+                 * that SACKs block is variable.
+	         *
+                 * "len" is invariant segment length, including TCP header.
+                 */
+
+		/* len diventa uguale alla lunghezza del payload più quella
+		 * dell'header TCP.
+		 */
+
+                len += skb->data - skb->h.raw;
+
+		/* TCP_MIN_RCVMSS è il RCV_MSS minimo e il suo valore 
+		 * è 536 mentre TCP_MIN_MSS è il minimo MSS accettato
+		 * e vale 88. Quindi se :
+		 * 1- o len è maggiore uguale di 536 + la dimensione 
+		 *    dell'header TCP
+		 * 2- o len è maggiore uguale di 88 + la dimensione
+		 *    dell'header TCP e  inoltre, considerando che 
+		 *    dai sorgenti si legge
+		 *
+		 * #define TCP_REMNANT (TCP_FLAG_FIN|TCP_FLAG_URG|TCP_FLAG_SYN|TCP_FLAG_PSH)
+		 *
+		 *    , nel terzo gruppo di 4 bytes dell'header TCP 
+		 *    non sono settati i flag FIN, URG, SYN e PSH (vedi 
+		 *    commento per PSH) allora dopo aver sottratto la 
+		 *    lunghezza dell'header TCP si aggiorna last_seg_size 
+		 *    ed eventualmente anche ack.rcv_mss qualora len == lss.
+		 */
+
+                if (len >= TCP_MIN_RCVMSS + sizeof(struct tcphdr) ||
+                  
+		    /* If PSH is not set, packet should be
+                     * full sized, provided peer TCP is not badly broken.
+                     * This observation (if it is correct 8)) allows
+                     * to handle super-low mtu links fairly.
+                     */
+
+                    (len >= TCP_MIN_MSS + sizeof(struct tcphdr) &&
+                     !(tcp_flag_word(skb->h.th)&TCP_REMNANT))) {
+
+                        /* Subtract also invariant (if peer is RFC compliant),
+                         * tcp header plus fixed timestamp option length.
+                         * Resulting "len" is MSS free of SACK jitter.
+			 */
+
+                        len -= tp->tcp_header_len;
+                        tp->ack.last_seg_size = len;
+                        if (len == lss) {
+                                tp->ack.rcv_mss = len;
+                                return;
+                        }
+                }
+                tp->ack.pending |= TCP_ACK_PUSHED;
+        }
+}
+
+
+Vediamo adesso queste funzioni che fanno riferimento al quickack mode.
+Un commento fa intuire che a questa modalità quickack è associato un counter
+e, se la sessione non è interattiva, si spediscono tanti quick acks
+quanto stabilito dal counter.
+ 
+
+static void tcp_incr_quickack(struct tcp_opt *tp)
+{
+
+	/* Formula semplice da capire in fondo...
+	 *
+	 *		 finestra di ricezione corrente
+	 * quickaks = -----------------------------------
+	 *		  2 * MSS per i delayed ack
+	 *
+	 * Vediamo di capirne il senso. La finestra di ricezione corrente
+	 * è il numero di bytes che l'host può ricevere (ossia quanti bytes
+	 * sono liberi nel buffer di ricezione). Dividendo per MSS ottengo
+	 * quanti segmenti full-sized posso ricevere.
+	 */
+
+        unsigned quickacks = tp->rcv_wnd/(2*tp->ack.rcv_mss);
+
+        if (quickacks==0)
+                quickacks=2;
+
+	 /* ack.quick è il numero di quick acks schedulati */
+
+        if (quickacks > tp->ack.quick)
+                tp->ack.quick = min(quickacks, TCP_MAX_QUICKACKS);
+}
+
+void tcp_enter_quickack_mode(struct tcp_opt *tp)
+{
+        tcp_incr_quickack(tp);
+        tp->ack.pingpong = 0;
+        tp->ack.ato = TCP_ATO_MIN;
+}
+
+/* Send ACKs quickly, if "quick" count is not exhausted
+ * and the session is not interactive.
+ */
+
+static __inline__ int tcp_in_quickack_mode(struct tcp_opt *tp)
+{
+        return (tp->ack.quick && !tp->ack.pingpong);
+}
+
+
+Andiamo avanti analizzando altre funzioni interessanti. 
+
+
+/* Buffer size and advertised window tuning.
+ *
+ * 1. Tuning sk->sndbuf, when connection enters established state.
+ */
+
+static void tcp_fixup_sndbuf(struct sock *sk)
+{
+        struct tcp_opt *tp = &(sk->tp_pinfo.af_tcp);
+
+	/* mss_clamp è il massimo MSS negoziato al 3WHS mentre
+	 * MAX_TCP_HEADER vale (128 + MAX_HEADER) il cui valore
+	 * varia in base al protocollo usato (vedi /include/linux/netdevice.h).
+	 */
+
+        int sndmem = tp->mss_clamp+MAX_TCP_HEADER+16+sizeof(struct sk_buff);
+
+	/* sk->sndbuf è la dimensione in bytes del send buffer
+	 * associato al socket.
+	 */
+
+        if (sk->sndbuf < 3*sndmem)
+                sk->sndbuf = min(3*sndmem, sysctl_tcp_wmem[2]);
+}
+
+
+/* 2. Tuning advertised window (window_clamp, rcv_ssthresh)
+ *
+ * All tcp_full_space() is split to two parts: "network" buffer, allocated
+ * forward and advertised in receiver window (tp->rcv_wnd) and
+ * "application buffer", required to isolate scheduling/application
+ * latencies from network.
+ * window_clamp is maximal advertised window. It can be less than
+ * tcp_full_space(), in this case tcp_full_space() - window_clamp
+ * is reserved for "application" buffer. The less window_clamp is
+ * the smoother our behaviour from viewpoint of network, but the lower
+ * throughput and the higher sensitivity of the connection to losses. 8)
+ *
+ * rcv_ssthresh is more strict window_clamp used at "slow start"
+ * phase to predict further behaviour of this connection.
+ * It is used for two goals:
+ * - to enforce header prediction at sender, even when application
+ *   requires some significant "application buffer". It is check #1.
+ * - to prevent pruning of receive queue because of misprediction
+ *   of receiver window. Check #2.
+ *
+ * The scheme does not work when sender sends good segments opening
+ * window and then starts to feed us spagetti. But it should work
+ * in common situations. Otherwise, we have to rely on queue collapsing.
+ */
+
+/* Slow part of check#2. */
+static int
+__tcp_grow_window(struct sock *sk, struct tcp_opt *tp, struct sk_buff *skb)
+{
+        /* Optimize this! */
+        int truesize = tcp_win_from_space(skb->truesize)/2;
+        int window = tcp_full_space(sk)/2;
+
+        while (tp->rcv_ssthresh <= window) {
+                if (truesize <= skb->len)
+                        return 2*tp->ack.rcv_mss;
+
+                truesize >>= 1;
+                window >>= 1;
+        }
+        return 0;
+}
+
+
+static __inline__ void
+tcp_grow_window(struct sock *sk, struct tcp_opt *tp, struct sk_buff *skb)
+{
+        /* Check #1 */
+        if (tp->rcv_ssthresh < tp->window_clamp &&
+            (int)tp->rcv_ssthresh < tcp_space(sk) &&
+            !tcp_memory_pressure) {
+                int incr;
+
+                /* Check #2. Increase window, if skb with such overhead
+                 * will fit to rcvbuf in future.
+                 */
+                if (tcp_win_from_space(skb->truesize) <= skb->len)
+                        incr = 2*tp->advmss;
+                else
+                        incr = __tcp_grow_window(sk, tp, skb);
+
+                if (incr) {
+                        tp->rcv_ssthresh = min(tp->rcv_ssthresh + incr, tp->window_clamp);
+              tp->ack.quick |= 1;
+                }
+        }
+}
+
+
+
+/* 3. Tuning rcvbuf, when connection enters established state. */
+
+static void tcp_fixup_rcvbuf(struct sock *sk)
+{
+        struct tcp_opt *tp = &(sk->tp_pinfo.af_tcp);
+
+	/* advmss è l'MSS annunciato. */
+
+        int rcvmem = tp->advmss+MAX_TCP_HEADER+16+sizeof(struct sk_buff);
+
+        /* Try to select rcvbuf so that 4 mss-sized segments
+         * will fit to window and correspoding skbs will fit to our rcvbuf.
+         * (was 3; 4 is minimum to allow fast retransmit to work.)
+         */
+
+	/* Vediamo come funziona questa inline.
+	 *
+	 * static inline int tcp_win_from_space(int space)
+	 * {
+	 *	return sysctl_tcp_adv_win_scale<=0 ?
+	 *		(space>>(-sysctl_tcp_adv_win_scale)) :
+	 *		space - (space>>sysctl_tcp_adv_win_scale);
+	 * }
+	 */
+
+        while (tcp_win_from_space(rcvmem) < tp->advmss)
+                rcvmem += 128;
+        if (sk->rcvbuf < 4*rcvmem)
+                sk->rcvbuf = min(4*rcvmem, sysctl_tcp_rmem[2]);
+}
+
+
+/* 4. Try to fixup all. It is made immediately after connection enters
+ *    established state.
+ */
+static void tcp_init_buffer_space(struct sock *sk)
+{
+        struct tcp_opt *tp = &(sk->tp_pinfo.af_tcp);
+        int maxwin;
+
+        if (!(sk->userlocks&SOCK_RCVBUF_LOCK))
+                tcp_fixup_rcvbuf(sk);
+        if (!(sk->userlocks&SOCK_SNDBUF_LOCK))
+                tcp_fixup_sndbuf(sk);
+
+	/ tcp_full_space() chiama soltanto la tcp_win_from_space() */
+
+        maxwin = tcp_full_space(sk);
+
+        if (tp->window_clamp >= maxwin) {
+                tp->window_clamp = maxwin;
+
+                if (sysctl_tcp_app_win && maxwin>4*tp->advmss)
+                        tp->window_clamp = max(maxwin-(maxwin>>sysctl_tcp_app_win), 4*tp->advmss);
+        }
+
+        /* Force reservation of one segment. */
+	 if (sysctl_tcp_app_win &&
+            tp->window_clamp > 2*tp->advmss &&
+            tp->window_clamp + tp->advmss > maxwin) 
+                tp->window_clamp = max(2*tp->advmss, maxwin-tp->advmss);
+
+        tp->rcv_ssthresh = min(tp->rcv_ssthresh, tp->window_clamp);
+        tp->snd_cwnd_stamp = tcp_time_stamp;
+}
+

@@ -1,0 +1,497 @@
+Descrizione della procedura di ricezione di un pacchetto a livello di TCP
+-------------------------------------------------------------------------
+autore : Angelo Dell'Aera - buffer@users.sourceforge.net
+--------------------------------------------------------
+
+
+Non ci si può permettere di lasciare fuori i SACK dalla discussione. 
+Leggere assolutamente RFC2018 e RFC2883 (per i D-SACKs) prima di andare avanti.
+
+
+	/* This procedure tags the retransmission queue when SACKs arrive.
+	 *
+	 * We have three tag bits: SACKED(S), RETRANS(R) and LOST(L).
+	 * Packets in queue with these bits set are counted in variables
+	 * sacked_out, retrans_out and lost_out, correspondingly.
+	 *
+	 * Valid combinations are:
+	 * Tag  InFlight	Description
+	 * 0	1		- orig segment is in flight.
+	 * S	0		- nothing flies, orig reached receiver.
+	 * L	0		- nothing flies, orig lost by net.
+	 * R	2		- both orig and retransmit are in flight.
+	 * L|R	1		- orig is lost, retransmit is in flight.
+	 * S|R  1		- orig reached receiver, retrans is still in flight.
+	 * (L|S|R is logically valid, it could occur when L|R is sacked,
+	 *  but it is equivalent to plain S and code short-curcuits it to S.
+	 *  L|S is logically invalid, it would mean -1 packet in flight 8))
+	 *
+	 * These 6 states form finite state machine, controlled by the following events:
+	 * 1. New ACK (+SACK) arrives. (tcp_sacktag_write_queue())
+	 * 2. Retransmission. (tcp_retransmit_skb(), tcp_xmit_retransmit_queue())
+	 * 3. Loss detection event of one of three flavors:
+	 *	A. Scoreboard estimator decided the packet is lost.
+	 *	   A'. Reno "three dupacks" marks head of queue lost.
+	 *	   A''. Its FACK modfication, head until snd.fack is lost.
+	 *	B. SACK arrives sacking data transmitted after never retransmitted
+	 *	   hole was sent out.
+	 *	C. SACK arrives sacking SND.NXT at the moment, when the
+	 *	   segment was retransmitted.
+	 * 4. D-SACK added new rule: D-SACK changes any tag to S.
+	 *
+	 * It is pleasant to note, that state diagram turns out to be commutative,
+	 * so that we are allowed not to be bothered by order of our actions,
+	 * when multiple events arrive simultaneously. (see the function below).
+	 *
+	 * Reordering detection.
+	 * --------------------
+	 * Reordering metric is maximal distance, which a packet can be displaced
+	 * in packet stream. With SACKs we can estimate it:
+	 *
+	 * 1. SACK fills old hole and the corresponding segment was not
+	 *    ever retransmitted -> reordering. Alas, we cannot use it
+	 *    when segment was retransmitted.
+	 * 2. The last flaw is solved with D-SACK. D-SACK arrives
+	 *    for retransmitted and already SACKed segment -> reordering..
+	 * Both of these heuristics are not used in Loss state, when we cannot
+	 * account for retransmits accurately.
+	 */
+
+	static int
+	tcp_sacktag_write_queue(struct sock *sk, struct sk_buff *ack_skb, u32 prior_snd_una)
+	{
+		struct tcp_opt *tp = &(sk->tp_pinfo.af_tcp);
+		unsigned char *ptr = ack_skb->h.raw + TCP_SKB_CB(ack_skb)->sacked;
+		struct tcp_sack_block *sp = (struct tcp_sack_block *)(ptr+2);
+		int num_sacks = (ptr[1] - TCPOLEN_SACK_BASE)>>3;
+		int reord = tp->packets_out;
+		int prior_fackets;
+		u32 lost_retrans = 0;
+		int flag = 0;
+		int i;
+
+		/*
+                *       in_flight = packets_out - left_out + retrans_out
+                *
+                *       packets_out is SND.NXT-SND.UNA counted in packets.
+                *
+                *       retrans_out is number of retransmitted segments.
+                *
+                *       left_out is number of segments left network, but not ACKed yet.
+                *
+                *               left_out = sacked_out + lost_out
+                *
+                *     sacked_out: Packets, which arrived to receiver out of order
+                *                  and hence not ACKed. With SACKs this number is simply
+                *                  amount of SACKed data. Even without SACKs
+                *                  it is easy to give pretty reliable estimate of this number,
+                *                  counting duplicate ACKs.
+		*       lost_out: Packets lost by network. TCP has no explicit
+                *                  "loss notification" feedback from network (for now).
+                *                  It means that this number can be only _guessed_.
+                *                  Actually, it is the heuristics to predict lossage that
+                *                  distinguishes different algorithms.
+                */
+
+		/* Propedeuticità:
+		 * "Forward Acknowledgment : Refining TCP Congestion Control"
+		 * Matthew Mathis and Jamshid Mahdavi
+		 * Pittsburgh Supercomputing Center
+		 * SIGCOMM 1996
+		 */
+
+		/* Se non ci sono segmenti SACKati portiamo a 0 anche il
+		 * numero di segmenti FACK.
+		 */
+
+		if (!tp->sacked_out)
+			tp->fackets_out = 0;
+		prior_fackets = tp->fackets_out;
+	
+		/* Se ci sono SACKs dobbiamo analizzarli subito */
+
+		for (i=0; i<num_sacks; i++, sp++) {
+			struct sk_buff *skb;
+
+			/* start_seq e end_seq sono i numeri di sequenza che 
+			 * caratterizzano il SACK block.
+			 */
+
+			__u32 start_seq = ntohl(sp->start_seq);
+			__u32 end_seq = ntohl(sp->end_seq);
+			int fack_count = 0;
+			int dup_sack = 0;
+	
+			/* Check for D-SACK. */
+			if (i == 0) {
+
+				/* Codice eseguito soltanto sul primo  blocco SACK o D-SACK 
+				 * in quanto in base a quanto stabilito da RFC2883 potrebbe
+				 * aver bisogno di un trattamento di riguardo.
+				 */
+
+				u32 ack = TCP_SKB_CB(ack_skb)->ack_seq;
+	
+				if (before(start_seq, ack)) {
+
+					/* Se start_seq viene prima di ack significa che il 
+					 * primo blocco è un D-SACK. Quindi il peer mi sta 
+					 * notificando di aver ricevuto un pacchetto duplicato. 
+					 * Incrementiamo dup_sack e impostiamo il flag 4 in 
+					 * tp->sack_ok.
+					 * Vedi in tcp_input.c le macro 
+					 *
+					 * #define IsReno(tp) ((tp)->sack_ok == 0)
+					 * #define IsFack(tp) ((tp)->sack_ok & 2)
+					 * #define IsDSack(tp) ((tp)->sack_ok & 4)
+					 * 
+					 */
+
+					dup_sack = 1;
+					tp->sack_ok |= 4;
+					NET_INC_STATS_BH(TCPDSACKRecv);
+				} else if (num_sacks > 1 &&
+					   !after(end_seq, ntohl(sp[1].end_seq)) &&
+					   !before(start_seq, ntohl(sp[1].start_seq))) {
+
+	       /* Che succede qui? Abbiamo più di 1 SACK block ma end_seq (start_seq) del primo 
+	        * blocco non precede (segue) end_seq (start_seq) del secondo SACK block. 
+		* Vediamolo graficamente.
+		*
+		* SACK block 1		------------|----------------------|---------			
+		*				start_seq1		end_seq1
+		*
+		*
+		* SACK block 2		--------|-------------------------------|----
+		*			     start_seq2			     end_seq2
+		*
+		* Si noti che per verificare la condizione deve essere
+		* start_seq2 <= start_seq1 e end_seq2 >= end_seq1
+		*
+		* Questa è esattamente la situazione descritta al paragrafo 4.2.3 dell'RFC2883 
+		* 'Two non contiguos duplicate subsegments not covered by the cumulative ACK'. 
+		* Riporto l'esempio citato nell'RFC perchè questo punto è delicato.
+		*
+		*	Segmento Trasmesso	Segmento Ricevuto	ACK spedito (con SACK)
+		*
+		*	     500-999		    500-999			1000
+		*	    1000-1499		    dropped			
+		*           1500-1999		    delayed
+		*           2000-2499               dropped
+                *           2500-2999               delayed
+	        *           3000-3499               dropped
+		*	    3500-3999		   3500-3999		 1000, SACK = 3500-4000
+		*	    1000-1499		    dropped
+		*	    1500-2999	           1500-1999		 1000, SACK = 1500-2000,
+		*								      3500-4000
+		*				   2500-2999		 1000, SACK = 2500-3000,
+		*								      1500-2000,
+		*								      3500-4000
+		*				   1500-2999		 1000, SACK = 1500-2000,
+		*								      1500-3000,
+		*								      3500-4000
+		*
+		* Nota: sull'RFC l'esempio riportato è sbagliato.
+		* Qui il segmento ricevuto 1500-2999 acka cumulativamente due blocchi SACKati e
+		* cioè 1500-1999 e 2500-2999. Si noti che sono non contigui.
+ 		* Per gli ultimi SACK block, il primo (1500-2000) riporta il primo sub-segmento
+		* duplicato mentre il secondo (1500-3000)  riporta il blocco più grande di dati
+		* cui esso appartiene.	    
+		*/    
+
+			
+					dup_sack = 1;
+					tp->sack_ok |= 4;
+					NET_INC_STATS_BH(TCPDSACKOfoRecv);
+				}
+	
+				/* D-SACK for already forgotten data...
+				 * Do dumb counting. */
+
+				/* Rilevato un D-SACK (questo ce lo dice dup_sack che è stato
+				 * eventualmente settato in uno dei controlli precedenti) se 
+				 * end_seq viene prima di snd_una (fa riferimento a dati già 
+				 * ackati) e viene dopo undo_marker si decrementa undo_retrans.
+				 */
+ 
+				if (dup_sack &&
+				    !after(end_seq, prior_snd_una) &&
+				    after(end_seq, tp->undo_marker))
+					tp->undo_retrans--;
+	
+				/* Eliminate too old ACKs, but take into
+				 * account more or less fresh ones, they can
+				 * contain valid SACK info.
+				 */
+				
+				/* Questo significa che ack è più piccolo di snd_una meno la 
+				 * massima finestra mai vista dal peer. Detto in parole povere 
+				 * non c'è niente di interessante in questo segmento. Perchè? 
+				 * Perchè se fosse vero il contrario in questo segmento potrebbe 	
+				 * esserci qualche byte di dati non ackati al peer.
+				 */
+
+				if (before(ack, prior_snd_una-tp->max_window))
+					return 0;
+			}
+
+			/* Codice eseguito per tutti i SACK blocks */
+	
+			/* Event "B" in the comment above. */
+
+			/* Qui si fa riferimento all'eventualità in cui un SACK arrivi sackando
+			 * dati trasmessi senza che sia mai stata la ritrasmissione di un hole.
+			 * In parole povere. Tutto procedeva per il meglio ma a un certo punto
+			 * ad esempio un segmento è lost. A quel punto il peer mi notifica 
+			 * tramite un SACK block che gli manca un pezzo.
+			 */
+			
+			/* Si tenga presente che high_seq altro non che è il snd_nxt all'inizio 
+			 * della congestione. A questo punto qui si va a controllare se 
+			 * end_seq > high_seq perchè se così fosse abbiamo perso uno o più
+			 * segmenti. Cerchiamo di capire il motivo. Se a un certo punto si
+			 * ha notifica di congestione high_seq viene impostato al valore
+			 * corrente di snd_nxt. Ora se il SACK che sto ricevendo ha un end_seq
+			 * minore di high_seq significa che mi sta sackando dati.
+			 * Se non siamo in congestione high_seq fa riferimento all'ultima
+			 * congestione e quindi questo evento significa che abbiamo perso dati.
+			 * RIVEDERE!
+			 */
+
+			if (after(end_seq, tp->high_seq))
+				flag |= FLAG_DATA_LOST;
+	
+			/* Scorriamo la retransmit queue */
+
+			for_retrans_queue(skb, sk, tp) {
+				u8 sacked = TCP_SKB_CB(skb)->sacked;
+				int in_sack;
+	
+				/* The retransmission queue is always in order, so
+				 * we can short-circuit the walk early.
+				 */
+	
+				/* Scorriamo la retransmit queue ma a causa dell'ordinamento della
+				 * stessa ci fermiamo se end_seq >= seq (abbiamo colmato l'hole)
+				 */
+
+				if(!before(TCP_SKB_CB(skb)->seq, end_seq))
+					break;
+	
+				/* Incrementiamo fack_count che dovrebbe servire per gestire i 
+				 * Forward ACK. 
+				 */
+
+				fack_count++;
+
+				/* Il flag in_sack indica se l'skb preso in considerazione nella 
+				 * retransmission queue è compreso o meno nel SACK block attualmente 
+				 * analizzato. Se è compreso mi restituisce 1. Si delineano quindi due 
+				 * situazioni.
+				 * 
+				 * A. Si tratta di un SACK.
+				 * In questo caso l'skb che genera in_sack 1 fa riferimento
+				 * a dati già ricevuti dal peer. Quindi può essere eliminato
+				 * dalla retransmit queue.
+				 * 
+				 * B. Si tratta di D-SACK. 
+				 * In questo caso in_sack 1 significa che il segmento è già stato
+				 * ricevuto dal peer e probabilmente è stato ritrasmesso dal nostro
+				 * end. Può essere eliminato dalla retransmit queue.
+				 */
+
+				in_sack = !after(start_seq, TCP_SKB_CB(skb)->seq) &&
+					!before(end_seq, TCP_SKB_CB(skb)->end_seq);
+	
+
+				/* Account D-SACK for retransmitted packet. */
+
+				/* Si tratta di un D-SACK e in_sack vale 1 (vedi sopra). 
+				 * Inoltre il flag sacked ci dice che trattasi di segmento ritrasmesso 
+				 * (ad esempio a causa del fatto che l'ack del peer è andato perso). 
+				 * Inoltre end_seq viene dopo undo_marker ('tracking retrans started 
+				 * here'). In questo caso si riduce undo_retrans ossia 'number of 
+				 * undoable retransmissions'.
+				 */ 
+
+				if ((dup_sack && in_sack) &&
+				    (sacked & TCPCB_RETRANS) &&
+				    after(TCP_SKB_CB(skb)->end_seq, tp->undo_marker))
+					tp->undo_retrans--;
+	
+				/* The frame is ACKed. */
+
+				/* Ricorda che all'inizio reord è stato inizializzato assegnandogli il 
+				 * valore di tp->packets_out. Se si entra in questo if significa che il 
+				 * frame è già stato ACKato perchè end_seq viene prima di snd_una.
+				 * Se sacked ha il flag TCPCB_SACKED_ACKED impostato significa che l'skb 
+				 * è stato ackato da un SACK.
+				 */
+
+				if (!after(TCP_SKB_CB(skb)->end_seq, tp->snd_una)) {
+					if (sacked&TCPCB_RETRANS) {
+
+						/* Il SACK block end_seq viene prima di snd_una
+					 	 * e il segmento risulta essere ritrasmesso. Se
+						 * trattasi di D-SACK, se in_sack vale 1 (il SACK
+						 * block copre l'skb) e se l'skb è stato ACKato 
+						 * da un SACK block si reimposta reord.
+						 */
+
+						if ((dup_sack && in_sack) &&
+						    (sacked&TCPCB_SACKED_ACKED))
+							reord = min(fack_count, reord);
+					} else {
+						/* If it was in a hole, we detected reordering. */
+						if (fack_count < prior_fackets &&
+						    !(sacked&TCPCB_SACKED_ACKED))
+							reord = min(fack_count, reord);
+					}
+	
+					/* Nothing to do; acked frame is about to be dropped. */
+					continue;
+				}
+
+				/* Si tratta di un skb ritrasmesso e inoltre il SACK block
+				 * end_seq viene dopo ack_seq (sembrerebbe quindi un SACK
+				 * classico come da RFC2018). Inoltre se :
+				 * 1- o lost_retrans è 0;
+				 * 2- o end_seq viene dopo lost_retrans
+				 * si aggiorna lost_retrans
+	
+				if ((sacked&TCPCB_SACKED_RETRANS) &&
+				    after(end_seq, TCP_SKB_CB(skb)->ack_seq) &&
+				    (!lost_retrans || after(end_seq, lost_retrans)))
+					lost_retrans = end_seq;
+	
+				/* Se in_sack vale 0 saltiamo alla prossima iterazione. 
+				 * Quindi si va avanti soltanto se il SACK block 'copre' l'skb
+				 * nella retransmit queue.
+			  	 */
+
+				if (!in_sack)
+					continue;
+	
+				if (!(sacked&TCPCB_SACKED_ACKED)) {
+					if (sacked & TCPCB_SACKED_RETRANS) {
+
+						/* If the segment is not tagged as lost,
+						 * we do not clear RETRANS, believing
+						 * that retransmission is still in flight.
+						 */
+
+						if (sacked & TCPCB_LOST) {
+
+							/* Segmento non ackato da un SACK, considerato 
+							 * perso e ritrasmesso quindi abbiamo L|R.
+							 * (orig is lost, retransmit is in flight)
+							 * In tal caso decrementiamo lost_out e 
+							 * retrans_out e ripuliamo il tag L|R.
+							 */
+
+							TCP_SKB_CB(skb)->sacked &= 
+								~(TCPCB_LOST|TCPCB_SACKED_RETRANS);
+							tp->lost_out--;
+							tp->retrans_out--;
+						}
+					} else {
+						/* New sack for not retransmitted frame,
+						 * which was in hole. It is reordering.
+						 */
+
+						/* Segmento non ritrasmesso */
+
+/*
+ * #define TCPCB_SACKED_RETRANS	0x02	SKB retransmitted		
+ * #define TCPCB_EVER_RETRANS	0x80	Ever retransmitted frame	
+ * #define TCPCB_RETRANS		(TCPCB_SACKED_RETRANS|TCPCB_EVER_RETRANS)
+ */
+
+						if (!(sacked & TCPCB_RETRANS) &&
+						    fack_count < prior_fackets)
+							reord = min(fack_count, reord);
+
+						/* Se il segmento era considerato lost... */	
+
+						if (sacked & TCPCB_LOST) {
+							TCP_SKB_CB(skb)->sacked &= ~TCPCB_LOST;
+							tp->lost_out--;
+						}
+					}
+
+					/* Settiamo qualche flag e aggiorniamo il numero di
+					 * segmenti SACKati presenti in queue nel caso in cui
+					 * il segmento sia stato ACKato da un SACK.
+					 */
+	
+					TCP_SKB_CB(skb)->sacked |= TCPCB_SACKED_ACKED;
+					flag |= FLAG_DATA_SACKED;
+					tp->sacked_out++;
+	
+					if (fack_count > tp->fackets_out)
+						tp->fackets_out = fack_count;
+				} else {
+					if (dup_sack && (sacked&TCPCB_RETRANS))
+						reord = min(fack_count, reord);
+				}
+	
+				/* D-SACK. We can detect redundant retransmission
+				 * in S|R and plain R frames and clear it.
+				 * undo_retrans is decreased above, L|R frames
+				 * are accounted above as well.
+				 */
+				if (dup_sack &&
+				    (TCP_SKB_CB(skb)->sacked&TCPCB_SACKED_RETRANS)) {
+					TCP_SKB_CB(skb)->sacked &= ~TCPCB_SACKED_RETRANS;
+					tp->retrans_out--;
+				}
+			}
+		}	
+
+		/* Check for lost retransmit. This superb idea is
+		 * borrowed from "ratehalving". Event "C".
+		 * Later note: FACK people cheated me again 8),
+		 * we have to account for reordering! Ugly,
+		 * but should help.
+		 */
+		if (lost_retrans && tp->ca_state == TCP_CA_Recovery) {
+			struct sk_buff *skb;
+	
+			for_retrans_queue(skb, sk, tp) {
+				if (after(TCP_SKB_CB(skb)->seq, lost_retrans))
+					break;
+				if (!after(TCP_SKB_CB(skb)->end_seq, tp->snd_una))
+					continue;
+				if ((TCP_SKB_CB(skb)->sacked&TCPCB_SACKED_RETRANS) &&
+				    after(lost_retrans, TCP_SKB_CB(skb)->ack_seq) &&
+				    (IsFack(tp) ||
+				     !before(lost_retrans, 
+						TCP_SKB_CB(skb)->ack_seq+tp->reordering*tp->mss_cache))) {
+					TCP_SKB_CB(skb)->sacked &= ~TCPCB_SACKED_RETRANS;
+					tp->retrans_out--;
+	
+					if (!(TCP_SKB_CB(skb)->sacked&(TCPCB_LOST|TCPCB_SACKED_ACKED))) 
+						{
+						tp->lost_out++;
+						TCP_SKB_CB(skb)->sacked |= TCPCB_LOST;
+						flag |= FLAG_DATA_SACKED;
+						NET_INC_STATS_BH(TCPLostRetransmit);
+					}
+				}
+			}
+		}
+	
+		tp->left_out = tp->sacked_out + tp->lost_out;
+	
+		if (reord < tp->fackets_out && tp->ca_state != TCP_CA_Loss)
+			tcp_update_reordering(tp, (tp->fackets_out+1)-reord, 0);
+	
+	#if FASTRETRANS_DEBUG > 0
+		BUG_TRAP((int)tp->sacked_out >= 0);
+		BUG_TRAP((int)tp->lost_out >= 0);
+		BUG_TRAP((int)tp->retrans_out >= 0);
+		BUG_TRAP((int)tcp_packets_in_flight(tp) >= 0);
+	#endif
+		return flag;
+	}
+
