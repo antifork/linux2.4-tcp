@@ -73,10 +73,9 @@ int tcp_v4_rcv(struct sk_buff *skb)
 		 * So, we defer the checks. 
 		 */
 
-		/* Qui il discorso è abbastanza complesso in quanto da un pò
-		 * di tempo a questa parte molte NIC riescono ad eseguire il
-		 * calcolo/verifica del checksum in hardware (fondamentale in un 
-		 * contesto di scattered/gathered DMA NIC altrimenti ci giochiamo 
+		/* Qui il discorso è abbastanza complesso in quanto da un pò di tempo a questa parte 
+		 * molte NIC riescono ad eseguire il calcolo/verifica del checksum in hardware 
+		 * (fondamentale in un contesto di scattered/gathered DMA NIC altrimenti ci giochiamo 
 		 * tutto!). Vediamo cosa dicono i commenti di Alan Cox.
 		 *
 		 * A. Checksumming of received packets by device.
@@ -174,7 +173,11 @@ int tcp_v4_rcv(struct sk_buff *skb)
 		 * stessa lista previa acquisizione di un altro read spinlock.
 		 * Un commento di Dave Miller inoltre fa notare la grande intuizione 
 		 * di Alexey Kuznetsov di non includere nella hash table i socket 
-		 * in stato TCP_CLOSE.
+		 * in stato TCP_CLOSE. A tal proposito consiglio vivamente di leggere
+		 * i commenti di Dave Miller in include/net/tcp.h (nelle primissime
+		 * righe del file) per comprendere bene il ruolo di questi buckets.
+		 * E' inutile stare a riscrivere tutto perchè Dave ha commentato tutto
+	 	 * davvero molto bene!   
 		 */
 
 		sk = __tcp_v4_lookup(skb->nh.iph->saddr, th->source,
@@ -365,6 +368,25 @@ Vediamo la tcp_prequeue() che cercherò di spiegare...ma spiegare l'arte è cosa a
 	static __inline__ int tcp_prequeue(struct sock *sk, struct sk_buff *skb)
 	{
 		struct tcp_opt *tp = &sk->tp_pinfo.af_tcp;
+
+		/* Precisazione su tp->ucopy.task
+		 * Andando a vedere nella struct tcp_opt si vede
+		 *  		 
+		 * Data for direct copy to user 
+        	 * struct {
+                 * 	struct sk_buff_head     prequeue;
+                 *	struct task_struct      *task;
+                 * 	struct iovec            *iov;
+                 *	int                     memory;
+                 * 	int                     len;
+        	 * } ucopy;
+		 *
+		 * Ora se andiamo a vedere in /usr/src/linux/include/net/tcp.h
+		 * la funzione tcp_prequeue_init() si nota che task viene settato a 
+		 * NULL. Il suo valore può essere cambiato durante la connessione.
+		 * Vedremo dopo quando succede questo ma per ora basti capire che
+		 * se è diverso da NULL allora possiamo andare in prequeuing.
+		 */
 	
 		if (tp->ucopy.task) {
 			
@@ -415,7 +437,17 @@ Vediamo la tcp_prequeue() che cercherò di spiegare...ma spiegare l'arte è cosa a
 				 *	get_port:	tcp_v4_get_port,
 				 *	};
 				 *
-				 * Toh chi si vede tcp_v4_do_rcv()! 
+				 * Toh chi si vede tcp_v4_do_rcv()!
+				 * Una precisazione per chi usualmente si fa domande esistenziali.
+				 * sk->backlog_rcv viene inizializzata come callback nel momento in
+				 * cui, tramite la inet_create() [af_inet.c], viene creato il socket
+				 * INET. Infatti prima si inizializza sk->prot che è un puntatore a
+				 * struct proto. Nel caso di TCP viene fatto puntare a quello che vedi
+				 * sopra e poco dopo la riga
+				 *
+				 * sk->backlog_rcv = sk->prot->backlog_rcv;
+				 * 
+				 * realizza l'arcano. Vedi la inet_create() per dettagli ulteriori.  
 				 */
 
 				while ((skb1 = __skb_dequeue(&tp->ucopy.prequeue)) != NULL) {
@@ -490,8 +522,8 @@ if (!sk->lock.users) {
                         sk_add_backlog(sk, skb);
 
 Se si va in prequeueing tcp_v4_do_rcv() la si esegue da tcp_prequeue() dopo aver ottimizzato
-altrimenti ci accontentiamo di chiamarla esplicitamente.
-Ci rimane sk_add_backlog() prima delle cose serie.
+altrimenti ci accontentiamo di chiamarla esplicitamente. Ci rimane sk_add_backlog() prima 
+delle cose serie.
 
 /* The per-socket spinlock must be held here. */
 	#define sk_add_backlog(__sk, __skb)			\
@@ -505,8 +537,8 @@ Ci rimane sk_add_backlog() prima delle cose serie.
 		(__skb)->next = NULL;				\
 	} while(0)
 
-Non spiego nulla perchè è troppo banale! Un'altra coda tutto qui!
-Ora alla luce di tutto ciò rivediamo quanto visto e capiamo l'arte.  
+Non spiego nulla perchè è troppo banale! Un'altra coda tutto qui! Ora alla luce di tutto ciò 
+rivediamo quanto visto e capiamo l'arte.  
 
  bh_lock_sock(sk);
                 ret = 0;
@@ -519,20 +551,17 @@ Ora alla luce di tutto ciò rivediamo quanto visto e capiamo l'arte.
 
  bh_unlock_sock(sk);
 
-Ora abbiamo detto che questa sezione di codice in quanto critica viene
-protetta da uno spinlock. Ipotizziamo che quando il software interrupt
-si è verificato il processo current sulla CPU che lo esegue sia proprio
-quello che ci interessa cioè detto in altri termini sk è un socket 
-descritto nella file table della task_struct del processo current. Se 
-questo è vero posso andare in prequeue come visto in precedenza perchè 
-mi conviene fare prequeue e aggiungere alla backlog di sk. Infatti questo
-mi consente di rilasciare immediatamente lo spinlock guadagnando in
-efficienza. Se non è vero chiamo normalmente tcp_v4_do_rcv(). 
+Ora abbiamo detto che questa sezione di codice in quanto critica viene protetta da uno spinlock. 
+Ipotizziamo che quando il software interrupt si è verificato il processo current sulla CPU che 
+lo esegue sia proprio quello che ci interessa cioè detto in altri termini sk è un socket descritto 
+nella file table della task_struct del processo current. Se questo è vero posso andare in prequeue 
+come visto in precedenza perchè mi conviene fare prequeue e aggiungere alla tp->ucopy.prequeue. 
+Infatti questo mi consente di rilasciare immediatamente lo spinlock guadagnando in efficienza. 
+Se non è vero chiamo normalmente tcp_v4_do_rcv(). 
 
 Nota importante
-La tcp_v4_do_rcv() viene chiamata anche nella tcp_prequeue() ma soltanto 
-quando viene superata il low water mark che l'applicazione a user space 
-può associare al socket mediante la setsockopt(2).
+La tcp_v4_do_rcv() viene chiamata anche nella tcp_prequeue() ma soltanto quando viene superata il 
+low water mark che l'applicazione a user space può associare al socket mediante la setsockopt(2).
 
 Andiamo avanti e vediamo adesso la tcp_v4_do_recv().
 
@@ -594,7 +623,8 @@ Andiamo avanti e vediamo adesso la tcp_v4_do_recv().
 		}
 
 		/* Tutti gli altri stati vengono gestiti dalla 
-		 * tcp_rcv_state_process() */
+		 * tcp_rcv_state_process() 
+		 */
 	
 		TCP_CHECK_TIMER(sk);
 		if (tcp_rcv_state_process(sk, skb, skb->h.th, skb->len))
@@ -809,7 +839,8 @@ Vediamo adesso la tcp_rcv_established().
 				 * ad un'ottimizzazione notevole. Infatti questo path
 				 * (fast) parte se ucopy.task == current ossia se il
 				 * processo owner del socket è attualmente in esecuzione
-				 * sulla CPU.
+				 * sulla CPU. Inoltre tp->copied_seq è definito come la
+				 * testa dei dati non ancora letti.
 				 * Mi è ignoto a questo punto il senso della successiva
 				 * __set_current_state(TASK_RUNNING)...non dovrebbe già
 				 * essere in quello stato? Trattasi forse di ulteriore
@@ -823,15 +854,14 @@ Vediamo adesso la tcp_rcv_established().
 
 					__set_current_state(TASK_RUNNING);
 
-
 					/* Vediamo come è fatta una struct iovec...anche
 					 * se queste cose avrei voglia di darle per 
 					 * scontate!
 					 *
 					 * struct iovec
 					 * {
-					 *	void *iov_base;		/* BSD uses caddr_t (1003.1g 
-					 *				requires void *) */
+					 *	void *iov_base;		 /* BSD uses caddr_t (1003.1g 
+					 *				    requires void *) */
 					 *	__kernel_size_t iov_len; /* Must be size_t (1003.1g) */
 					 * };
 					 * 
@@ -843,9 +873,10 @@ Vediamo adesso la tcp_rcv_established().
 	
 					if (!tcp_copy_to_iovec(sk, skb, tcp_header_len)) {
 
-						/* E'andata bene. I dati sono già disponibili
-						 * a user space tramite una o più iovec...che 
-						 * devi studiare! Aggiorniamo due cosette e via.
+						/* E'andata bene. I dati sono disponibili in tp->ucopy.iov. 
+						 * La __skb_pull rimuove dati dall'inizio di skb e precisamente 
+						 * rimuove l'header TCP. Possiamo avanzare rcv_nxt e per ricordare
+						 * che tutte queste splendide cose sono accadute poniamo eaten a 1.
 						 */
 
 						__skb_pull(skb, tcp_header_len);
@@ -856,7 +887,7 @@ Vediamo adesso la tcp_rcv_established().
 				}
 				if (!eaten) {
 
-					/* Niente ottimizzazione!
+					/* Niente ottimizzazione...eaten è 0! 
 					 * Vediamo come si mette...ma quante volte
 					 * lo controlliamo sto benedetto csum?!
 					 */
@@ -871,8 +902,8 @@ Vediamo adesso la tcp_rcv_established().
 	
 					/* Bulk data transfer: receiver */
 
-					/* Beh è andata comunque! 
-					 * Tutti in coda nella receive queue...
+					/* Beh è andata comunque! Rimuoviamo l'header TCP mediante __skb_pull 
+					 * e mettiamo il bambino in coda nella receive queue. 
 					 */
 
 					__skb_pull(skb,tcp_header_len);
@@ -881,18 +912,18 @@ Vediamo adesso la tcp_rcv_established().
 					tp->rcv_nxt = TCP_SKB_CB(skb)->end_seq;
 				}
 	
-				/* Questa mi suona molto orgogliosa come funzione..	
-				 * viene chiamata in entrambi i casi...la analizzo 
- 				 * dopo. Prima di andare avanti nella lettura fai
-				 * un salto qualche riga più giù e veditela perchè
-				 * non è solo importante...di più!
+				/* Questa mi suona molto orgogliosa come funzione e viene chiamata in entrambi i 
+				 * casi...la analizzo dopo. Prima di andare avanti nella lettura fai un salto 
+				 * qualche riga più giù e veditela perchè è alquanto importante.
 				 */
 
 				tcp_event_data_recv(sk, tp, skb);
 	
 				if (TCP_SKB_CB(skb)->ack_seq != tp->snd_una) {
 					
-					/* Dati, dati in arrivo! */
+					/* Se questo sta succedendo significa che questo pacchetto mi 
+					 * sta anche ackando dati (oltre a portare dati con sè).
+				         */
 
 					/* Well, only one small jumplet in fast path... */
 					tcp_ack(sk, skb, FLAG_DATA);
@@ -904,7 +935,8 @@ Vediamo adesso la tcp_rcv_established().
 				/* Se eaten = 1 (vedi sopra) controlliamo se ci
 				 * troviamo in quickack mode e se è così spediamo
 				 * immediatamente un ack altrimenti lo spediamo
-				 * ritardato.
+				 * ritardato. Nel caso in cui eaten sia 0 si esegue
+			 	 * un controllo per vedere se è necessario spedire l'ack.
 				 */
 			
 				if (eaten) {
@@ -978,8 +1010,7 @@ Vediamo adesso la tcp_rcv_established().
 				goto discard;
 			}
 			/* Resets are accepted even if PAWS failed.
-	
-			   ts_recent update must be made after we are sure
+		           ts_recent update must be made after we are sure
 			   that the packet is in window.
 			 */
 		}
@@ -1178,12 +1209,12 @@ Vediamo adesso la tcp_rcv_established().
 Vediamo la tcp_copy_to_iovec() seguendola nei vari passi. Ricordiamo che questa
 era stata chiamata con terzo parametro tcp_header_len.
 
-
 static int tcp_copy_to_iovec(struct sock *sk, struct sk_buff *skb, int hlen)
 	{
 		struct tcp_opt *tp = &(sk->tp_pinfo.af_tcp);
 
-		/* Serve dire che chunk conta i nytes di dati? */
+		/* Serve dire che chunk conta i bytes di dati? */
+
 		int chunk = skb->len - hlen;
 		int err;
 	
@@ -1217,6 +1248,7 @@ a proposito del calcolo/verifica del checksum fatto dalla NIC ).
 	 *	Copy a datagram to an iovec.
 	 *	Note: the iovec is modified during the copy.
 	 */
+
 	int skb_copy_datagram_iovec(const struct sk_buff *skb, int offset, struct iovec *to,
 				    int len)
 	{
@@ -1458,7 +1490,7 @@ Bene possiamo andare...
 		 * snd_una). 
 		 * 
 		 * Primo caso:
-		 * non abbiamo settato FLAG_SLOWPATH e ack è maggiore di  snd_una. Quindi c'è 
+		 * non abbiamo settato FLAG_SLOWPATH e ack è maggiore di snd_una. Quindi c'è 
 		 * 'qualcosa' che viene ackato...vediamo vediamo!
 		 * Nota : in caso di ricezione di ack puro il flag è 0 e quindi ovviamente la 
 		 * prima condizione è soddisfatta. Ora se l'ACK sta aprendo la finestra si entra 
