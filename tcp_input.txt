@@ -1970,7 +1970,7 @@ vediamola nel dettaglio cercando di capire tutto!
 				}
 				break;
 
-			/* Qui stiamo uscendo dalla fase Recovery perchè evdentemente è stato ACKato
+			/* Qui stiamo uscendo dalla fase Recovery perchè evidentemente è stato ACKato
 			 * high_seq. Vediamo che succede. tcp_reset_reno_sack() porta sacked_out a 0
 			 * e pone left_out uguale a lost_out. La tcp_try_undo_recovery() porta lo stato
 			 * in TCP_CA_Open. Con una sola eccezione : se high_seq = snd_una e siamo in
@@ -2104,8 +2104,13 @@ vediamola nel dettaglio cercando di capire tutto!
 
 			/* tcp_time_to_recover() testa determinate condizioni (vedi sotto).
 			 * Fino a quando mi restituisce 0 Linux cerca di tenere lo stato a
-			 * TCP_CA_Open ma (vedi sotto) basta un solo dupack (che ha portato
-			 * sacked_out a 1) per entrare in TCP_CA_Recovery.
+			 * TCP_CA_Open. A questo punto sarebbe opportuno dare un'occhiata
+			 * alle funzioni tcp_time_to_recover() e tcp_try_to_open() che ho
+			 * riportato e commentato più in basso. Dopo averle viste ritorna
+			 * qui e riprendi a leggere! 8)
+			 * Letto? Bene!
+			 * Come si sarà notato se si esegue tcp_try_to_open() è possibile 
+			 * entrare in TCP_CA_Disorder.
 			 */
 	
 			if (!tcp_time_to_recover(sk, tp)) {
@@ -2207,15 +2212,33 @@ vediamola nel dettaglio cercando di capire tutto!
 		 * capire come venga realizzato. Questa funzione infatti lavora come previsto dalla
 		 * rate-halving. Mi spiego meglio. Contrariamente a quanto fa il classico Reno 
 		 * presente fin dal 4.3BSD-Reno (ma anche in 4.4BSD) la cwnd non viene toccata.
-		 * In 4.4BSD infatti dopo aver ridotto ssthresh a ssthresh/2 e cwnd a cwnd/2 (in
+		 * In 4.4BSD infatti dopo aver ridotto ssthresh a ssthresh/2 e cwnd a ssthresh + 3 (in
 		 * modo da rimanere in congestion avoidance) si fa la inflation della cwnd di 1
-		 * per ogni dupack ricevuto.
+		 * per ogni dupack ricevuto (vedi RFC2581). In pratica l'effetto è dimezzare il rate
+		 * di trasmissione. Perchè? Semplicemente perchè a ben pensarci ssthresh rappresenta
+		 * una misura della capacità del pipe. Infatti, slow start e congestion avoidance 
+		 * possono essere lette in questi termini. Se ho un valore di ssthresh in un determinato
+		 * istante allora questa è una stima di quanti segmenti posso avere nel pipe. Se cwnd
+		 * < cwnd sono in slow start e quindi aumento velocemente cwnd (ogni ACK che ricevo
+		 * lo aumento di 1) per arrivare velocemente a ssthresh. Quando cwnd > ssthresh sono
+		 * in congestion avoidance e aumento cwnd di 1 ogni RTT. Perchè? Perchè le condizioni
+		 * della rete potrebbero mutare a mio favore e quindi devo continuare a probare la
+		 * rete per vedere se posso andare più veloce. Tutto qui!
 		 * Per dimezzare il rate qui si fa qualcosa di molto più cool! 8)
-		 * La cwnd non la tocco all'ingresso in Fast Recovery ma trasmetto un pacchetto
-		 * ogni DUE dupack e quando trasmetto decremento di 1 cwnd. Perchè è ganza questa
-		 * cosa? Perchè portarsi a cwnd/2 significa penalizzare di molto il rate soprattutto
-		 * se esco all'istante dalla Recovery. Trasmettendo ogni due dupack ottengo lo stesso
-		 * effetto di Reno classico e all'uscita da Fast Recovery troverò
+		 * La cwnd non la tocco all'ingresso in Fast Recovery ma ogni DUE dupack decremento 
+		 * di 1 cwnd. Perchè è ganza questa cosa? Perchè portarsi a ssthresh/2 e poi mettere
+		 * cwnd = ssthresh + 3 significa penalizzare di molto le performance e il motivo è
+		 * facile da capire. Facendo questo abbassamento ho una cwnd dal valore comunque elevato
+		 * ma se invece la abbasso (Reno classico) potrei trovarmi a perdere il self-clocking
+		 * in quanto potrei trovarmi nelle condizioni di non trasmettere nulla per lungo tempo.
+		 * Vediamo un esempio. 
+		 * Ipotizziamo cwnd = 20 ssthresh = 12 quando si entra in TCP_CA_Recovery. Reno classico
+		 * setta ssthresh = 6 e cwnd = 9. Verissimo che sono in congestion avoidance ma se avevo
+		 * cwnd = 20 prima di entrare in Recovery (quindi 20 pacchetti in flight) per poter 
+		 * trasmettere il successivo pacchetto devo aspettare un pò e precisamente che i pacchetti 
+		 * in flight diventino meno di 9 altrimenti resto ad aspettare!
+		 * L'effetto di questo simpatico giochino è trasmettere ogni due dupack e così ottengo 
+		 * lo stesso effetto di Reno classico e all'uscita da Fast Recovery troverò
 		 * cwnd = (cwnd_inizio_recovery - dupack_ricevuti)/2
 		 * Really cool...non c'è che dire!
 		 */  
@@ -2224,6 +2247,12 @@ vediamola nel dettaglio cercando di capire tutto!
 		tcp_xmit_retransmit_queue(sk);
 	}
 
+
+Leggere il commento qui sotto prima di tutto. L'idea è semplice. Quando riceviamo un dupack
+(vedi sopra) e siamo in stato TCP_CA_Open o TCP_CA_Disorder viene chiamata questa funzione
+il cui compito, come dice il commento, è decidere se si deve entrare in TCP_CA_Recovery 
+(la famosa fase di Fast Recovery tanto per usare le parole di Van Jacobson). Se è matchato
+anche una sola condizione si entra in TCP_CA_Recovery...  
 
 
 	/* This function decides, when we should leave Disordered state
@@ -2237,19 +2266,50 @@ vediamola nel dettaglio cercando di capire tutto!
 	{
 		/* Trick#1: The loss is proven. */
 
-		/* Abbiamo almeno un pacchetto marcato come lost e quindi un solo dupack può
-		 * portare a questa situazione se 
-		 * - siamo in NewReno (ricorda che il dupack incrementa sacked_out per 
-		 *   emulare una connessione 'sacked')
-		 * - siamo in SACK/FACK e fackets_out - sacked_out > 0 ossia mi viene SACKato
-		 *   un blocco che indica che mi sono perso almeno un pacchetto.
-		 * Chiaro no?
+		/*
+		 * Almeno un segmento è marcato come lost. A questo punto è inutile
+		 * attendere perchè so che un segmento non è arrivato al peer. Devo
+		 * ritrasmettere.
 		 */
  
 		if (tp->lost_out)
 			return 1;
 	
 		/* Not-A-Trick#2 : Classic rule... */
+
+		/*
+		 * Classical rule anche se a vederla scritta così qualcuno potrebbe pensare
+		 * che forse gli sta sfuggendo qualcosa... Vediamola nel dettaglio.
+		 * 
+		 * static inline int tcp_fackets_out(struct tcp_opt *tp)
+		 * {
+        	 *	return IsReno(tp) ? tp->sacked_out+1 : tp->fackets_out;
+		 * }
+		 *
+		 * Faccio l'assunzione che sappiate come funziona FACK e non lo spiego (il
+		 * paper su FACK lo trovate all'URL http://buffer.antifork.org). Dobbiamo 
+		 * capire che cosa rappresenta tp->reordering. Se dicessi che è la packet
+		 * reordering metric lo 0.004% del pubblico direbbe "Ah chiaro!" mentre gli 
+		 * altri "Eh?!". Veniamo incontro al 99.996% del pubblico allora! 8)
+		 * 
+		 * Dalla documentazione delle ip-sysctl si legge
+		 *
+		 * tcp_reordering - INTEGER
+        	 * Maximal reordering of packets in a TCP stream.
+        	 * Default: 3
+		 *
+		 * Ragioniamo con NewReno. Questo significa che se sacked_out + 1 > 3 ossia
+		 * se sacked_out >= 3 la condizione è soddisfatta. Ma questi sono i famosi
+		 * 3 dupacks di cui parla Van Jacobson che servono per entrare in Fast
+		 * Retransmit? Sure man! 8)
+		 *
+		 * Ragioniamo con SACK/FACK. fackets_out > 3 significa semplicemente che se
+		 * con un dupack mi viene sackato un segmento e il SACK block dice ho perso
+		 * almeno 3 segmenti devo entrare in TCP_CA_Recovery. Se hai letto il paper
+		 * non hai bisogno di altri commenti.
+		 *
+		 */
+
 		if (tcp_fackets_out(tp) > tp->reordering)
 			return 1;
 	
@@ -2361,9 +2421,7 @@ nel buio più pesto! 8)
 		 * Se stiamo usando NewReno viene eseguito il ramo else e questo dovrebbe portare a 
 		 * marcare come lost soltanto il PRIMO segmento nella retransmission queue. Nel caso
 		 * in cui sia abilitato SACK/FACK tutti i segmenti fino al primo SACKed saranno marcati
-		 * come lost. Obviously questo è vero if (I_understood_RFCs && !My_brain_is_not_damaged) 
-		 * 8) Un controllo è il minimo.... Dopo il controllo posso affermare che avevo visto
-		 * giusto! Meglio così!
+		 * come lost. 
 		 */ 
 
 		if (IsFack(tp)) {
@@ -2441,6 +2499,15 @@ Ricorda che
 	
 	static void tcp_cwnd_down(struct tcp_opt *tp)
 	{
+
+		/* Giochino molto interessante e subdolo allo stesso tempo! 8)
+		 * Ricordi il discorso sulla rate-halving? Beh questo è il codice! Quando
+		 * si entra in TCP_CA_Recovery tp->snd_cwnd_cnt viene messo a 0. Ora si
+		 * noti che, una volta entrati in TCP_CA_Recovery, decr vale alternativamente
+		 * 0 e 1 il che significa che si decrementa cwnd ogni due dupack (se non abbiamo
+		 * già toccato il limite inferiore di ssthresh/2.
+		 */
+
 		int decr = tp->snd_cwnd_cnt + 1;
 	
 		tp->snd_cwnd_cnt = decr&1;
@@ -2449,6 +2516,10 @@ Ricorda che
 		if (decr && tp->snd_cwnd > tp->snd_ssthresh/2)
 			tp->snd_cwnd -= decr;
 	
+		/* Controllo per assicurare che vi sia consistenza nel valore appena calcolato
+		 * per tp->snd_cwnd.
+		 */
+
 		tp->snd_cwnd = min(tp->snd_cwnd, tcp_packets_in_flight(tp)+1);
 		tp->snd_cwnd_stamp = tcp_time_stamp;
 	}
