@@ -2212,7 +2212,7 @@ vediamola nel dettaglio cercando di capire tutto!
 		 * capire come venga realizzato. Questa funzione infatti lavora come previsto dalla
 		 * rate-halving. Mi spiego meglio. Contrariamente a quanto fa il classico Reno 
 		 * presente fin dal 4.3BSD-Reno (ma anche in 4.4BSD) la cwnd non viene toccata.
-		 * In 4.4BSD infatti dopo aver ridotto ssthresh a ssthresh/2 e cwnd a ssthresh + 3 (in
+		 * In 4.4BSD infatti dopo aver ridotto ssthresh a cwnd/2 e cwnd a ssthresh + 3 (in
 		 * modo da rimanere in congestion avoidance) si fa la inflation della cwnd di 1
 		 * per ogni dupack ricevuto (vedi RFC2581). In pratica l'effetto è dimezzare il rate
 		 * di trasmissione. Perchè? Semplicemente perchè a ben pensarci ssthresh rappresenta
@@ -2233,10 +2233,10 @@ vediamola nel dettaglio cercando di capire tutto!
 		 * in quanto potrei trovarmi nelle condizioni di non trasmettere nulla per lungo tempo.
 		 * Vediamo un esempio. 
 		 * Ipotizziamo cwnd = 20 ssthresh = 12 quando si entra in TCP_CA_Recovery. Reno classico
-		 * setta ssthresh = 6 e cwnd = 9. Verissimo che sono in congestion avoidance ma se avevo
+		 * setta ssthresh = 10 e cwnd = 13. Verissimo che sono in congestion avoidance ma se avevo
 		 * cwnd = 20 prima di entrare in Recovery (quindi 20 pacchetti in flight) per poter 
 		 * trasmettere il successivo pacchetto devo aspettare un pò e precisamente che i pacchetti 
-		 * in flight diventino meno di 9 altrimenti resto ad aspettare!
+		 * in flight diventino meno di 13 altrimenti resto ad aspettare!
 		 * L'effetto di questo simpatico giochino è trasmettere ogni due dupack e così ottengo 
 		 * lo stesso effetto di Reno classico e all'uscita da Fast Recovery troverò
 		 * cwnd = (cwnd_inizio_recovery - dupack_ricevuti)/2
